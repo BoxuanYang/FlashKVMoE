@@ -19,11 +19,19 @@ KT 模式自动禁用 CUDA graph。其他模型/精度/TP 配置会报错。
 
 ## 1. 克隆与安装
 
-在实验室 Linux x86-64 机器执行，需要 AVX2 CPU、支持 BF16 的 NVIDIA GPU、可用的 CUDA
-Toolkit（`nvcc`）及兼容驱动。示例使用 Python 3.12、PyTorch 2.9.1 CUDA 12.8；机器需要
-支持 CUDA 12.8 的驱动，并让 `CUDA_HOME` 指向 CUDA 12.8 Toolkit。
+在实验室 Linux x86-64 机器执行，全部用户态依赖通过 conda/pip 安装，不需要 sudo 或 apt。
+需要 AVX2 CPU、支持 BF16 的 NVIDIA GPU，以及机器已有的兼容 NVIDIA 驱动。
+示例使用 Python 3.12、PyTorch 2.9.1 CUDA 12.8；CUDA Toolkit 和 C/C++ 编译器也装入
+conda 环境。Conda 不安装内核驱动，先确认机器上的 `nvidia-smi` 能正常运行。
 
 ```bash
+conda create -n minisgl-kt --override-channels -c conda-forge -y \
+  python=3.12 pip git 'cmake<4' ninja make pkg-config libhwloc libnuma \
+  gcc_linux-64=13 gxx_linux-64=13
+conda activate minisgl-kt
+conda install --override-channels -c nvidia/label/cuda-12.8.1 -c conda-forge -y \
+  cuda-toolkit=12.8.1
+
 git clone --branch main https://github.com/BoxuanYang/FlashKVMoE.git
 cd FlashKVMoE
 
@@ -34,21 +42,27 @@ git -C third_party/ktransformers submodule update --init --recursive \
 git -C third_party/ktransformers rev-parse HEAD
 # 4882505c9a66a6784b3360a1b6ba9b23d53d0291
 
-conda create -n minisgl-kt python=3.12 -y
-conda activate minisgl-kt
-
-sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build pkg-config libhwloc-dev libnuma-dev
-export CUDA_HOME=/usr/local/cuda-12.8
+# 编译和后续启动服务时均使用当前 conda 环境的工具链。
+export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
+export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-cc"
+export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
+export CUDAHOSTCXX="$CXX"
+export CMAKE_PREFIX_PATH="$CONDA_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig:$CONDA_PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 nvcc --version
+"$CXX" --version
+pkg-config --modversion hwloc
 nvidia-smi
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -e .
-CPUINFER_USE_CUDA=1 CPUINFER_CPU_INSTRUCT=NATIVE CPUINFER_PARALLEL=8 \
-  python -m pip install -v -e third_party/ktransformers/kt-kernel
+# 禁用构建隔离，让 KT 使用上面固定的 conda CMake 和编译环境。
+python -m pip install pybind11
+CMAKE_ARGS="-DUSE_CONDA_TOOLCHAIN=ON" \
+  CPUINFER_USE_CUDA=1 CPUINFER_CPU_INSTRUCT=NATIVE CPUINFER_PARALLEL=8 \
+  python -m pip install --no-build-isolation -v -e third_party/ktransformers/kt-kernel
 python -m pip install pytest
 python -m pip check
 
@@ -68,6 +82,15 @@ PY
 
 KT 以 editable 方式安装，修改 `third_party/ktransformers/kt-kernel/python` 后重启服务即可。
 修改 C++ 则重新执行上面的 KT 安装命令，增加 `CPUINFER_FORCE_REBUILD=1`。
+`USE_CONDA_TOOLCHAIN=ON` 是固定 KT 源码已有的开关：选择 conda 编译器，并将 conda 的
+头文件、库、pkg-config 和运行时 RPATH 加入搜索路径。仅安装 conda GCC 而不启用该开关，
+KT 仍可能强制选择 `/usr/bin/gcc`。GCC 固定为 13，处于 CUDA 12.8 支持范围内。
+
+新开终端后，先 `conda activate minisgl-kt`，再执行上面的环境变量 export 段，然后运行
+后面的服务启动命令，确保 Mini-SGLang 的 JIT 编译能找到 conda CUDA 和 C++ 编译器。
+这套 conda 安装命令已按上游构建脚本核对，但尚未在实验室 Linux 机器实际编译验证。
+依赖来源：[NVIDIA conda 安装说明](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-installation-guide-linux/index.html#conda-installation)、
+[libhwloc](https://anaconda.org/conda-forge/libhwloc)、[libnuma](https://anaconda.org/conda-forge/libnuma)。
 
 ## 2. 权重
 
