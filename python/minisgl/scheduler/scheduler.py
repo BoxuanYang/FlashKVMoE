@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import perf_counter
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -66,6 +67,8 @@ class Scheduler(SchedulerIOMixin):
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
+        # Track scheduler arrival time and prompt length across prefill chunks.
+        self.req_timings: dict[int, tuple[float, int]] = {}
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
@@ -141,6 +144,7 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        completed_at = perf_counter()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -157,6 +161,20 @@ class Scheduler(SchedulerIOMixin):
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
+                    timing = self.req_timings.pop(req.uid, None)
+                    if timing is not None:
+                        started_at, input_len = timing
+                        elapsed = completed_at - started_at
+                        output_tokens = len(req.input_ids) - input_len
+                        speed = output_tokens / elapsed if elapsed > 0 else 0.0
+                        logger.info_rank0(
+                            "Request %d finished: elapsed=%.3f s, output_tokens=%d, "
+                            "speed=%.2f token/s",
+                            req.uid,
+                            elapsed,
+                            output_tokens,
+                            speed,
+                        )
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
@@ -173,6 +191,7 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
+            received_at = perf_counter()
             logger.debug_rank0("Received user msg: %s", msg)
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
@@ -186,8 +205,10 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            self.req_timings[msg.uid] = (received_at, input_len)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
+            self.req_timings.pop(msg.uid, None)
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
