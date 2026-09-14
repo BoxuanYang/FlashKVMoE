@@ -126,6 +126,9 @@ Once the server is running, you can send requests using standard tools like `cur
 
 ### 4. Interactive Shell
 
+For Qwen3-30B-A3B / Qwen3-235B-A22B with GPU attention and CPU experts, see the
+[standalone KTransformers setup and launch commands](./docs/ktransformers.md).
+
 Chat with your model directly in the terminal by adding the `--shell` flag.
 
 ```bash

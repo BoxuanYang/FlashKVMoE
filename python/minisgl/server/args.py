@@ -223,6 +223,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    parser.add_argument("--kt-weight-path", default=ServerArgs.kt_weight_path)
+    parser.add_argument("--kt-cpuinfer", type=int, default=ServerArgs.kt_cpuinfer)
+    parser.add_argument("--kt-threadpool-count", type=int, default=ServerArgs.kt_threadpool_count)
+    parser.add_argument("--kt-method", choices=["LLAMAFILE"], default=ServerArgs.kt_method)
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 

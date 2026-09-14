@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 class Qwen3DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
-        self.mlp = Qwen3MLP(config)
+        self.mlp = Qwen3MLP(config, layer_id)
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,

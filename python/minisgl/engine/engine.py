@@ -46,10 +46,18 @@ class Engine:
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
+        if config.model_config.is_moe:
+            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend, config)
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        if config.moe_backend == "ktransformers":
+            weights = self.model.state_dict()
+            assert not any(".experts." in name for name in weights)
+            assert all(tensor.device == self.device for tensor in weights.values())
+            gpu_bytes = sum(t.numel() * t.element_size() for t in weights.values())
+            logger.info_rank0(f"Non-expert model weights on GPU: {mem_GB(gpu_bytes)}")
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -76,8 +84,6 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
-        if config.model_config.is_moe:
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -143,7 +149,14 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                k: v.to(self.dtype)
+                for k, v in load_weight(
+                    config.model_path,
+                    self.device,
+                    skip_experts=config.moe_backend == "ktransformers",
+                )
+            }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
@@ -218,6 +231,14 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.moe_backend == "ktransformers":
+        from minisgl.moe.ktransformers import validate_config
+
+        validate_config(config)
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.info_rank0("KTransformers: all experts on CPU; CUDA graphs disabled")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

@@ -1,0 +1,3 @@
+[submodule "third_party/ktransformers"]
+	path = third_party/ktransformers
+	url = https://github.com/kvcache-ai/ktransformers.git

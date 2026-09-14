@@ -16,6 +16,7 @@ class MoELayer(BaseOP):
         renormalize: bool = True,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        layer_id: int = 0,
     ):
         super().__init__()
 
@@ -30,6 +31,10 @@ class MoELayer(BaseOP):
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        self._layer_id = layer_id
+        if get_global_ctx().moe_backend.cpu_experts:
+            self.gate_up_proj = self.down_proj = None
+            return
         intermediate_size_per_partition = div_even(intermediate_size, tp_size)
         self.gate_up_proj = torch.empty(
             num_experts,
@@ -53,6 +58,7 @@ class MoELayer(BaseOP):
             renormalize=self.renormalize,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            layer_id=self._layer_id,
         )
         if self.tp_size > 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
