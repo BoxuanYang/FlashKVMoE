@@ -28,6 +28,12 @@ older `num_gpu_experts` example in the
 Edit the adapter for Mini-SGLang integration changes; edit the submodule and rebuild
 `kt-kernel` for CPU kernel changes.
 
+The adapter creates one `KTMoEWrapper` per layer, calls `load_weights()` once,
+then calls `forward(hidden_states, topk_ids, topk_weights, cuda_stream)` per step.
+KT handles GGUF loading, CPU buffers, submission, synchronization and result copies;
+Mini-SGLang supplies routing and the current CUDA stream. Remote machine access
+is not required to implement this integration; the checks below are optional lab verification.
+
 Only BF16 GPU weights, LLAMAFILE, and TP=1 are supported here. Experts on GPU and
 deferred experts are fixed to zero. CUDA graphs are disabled automatically.
 The existing `fused` backend remains the default when KT is not selected.
@@ -176,9 +182,9 @@ curl --fail-with-body http://127.0.0.1:30000/v1/chat/completions \
   -d '{"model":"Qwen3","messages":[{"role":"user","content":"What is 2 + 2? /no_think"}],"temperature":0,"max_tokens":32}'
 ```
 
-Startup logs report CPU expert layers, `GPU expert weights: 0`, and the GPU memory
-occupied by non-expert model parameters. These checks establish placement and
-execution; inspect generated answers as well when validating your GGUF quantization.
+Startup checks assert that the model has no GPU expert parameters and that all
+remaining model weights are on GPU, then log their memory usage. KT prints its
+per-layer loading details. Inspect generated answers when validating your GGUF quantization.
 
 Local validation: Python 3.12, PyTorch 2.9.1 and Transformers 4.57.3 on Windows;
 18 tests passed, the real CUDA/KT test was skipped. Full 30B/235B inference and the

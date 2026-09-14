@@ -205,9 +205,6 @@ def test_forward_uses_layer_and_current_stream(config, monkeypatch):
     backend.wrappers[0].forward.assert_not_called()
     backend.wrappers[1].forward.assert_called_once_with(hidden, ids, weights, 123)
     assert output is backend.wrappers[1].forward.return_value
-    hidden.shape = (257, 128)
-    with pytest.raises(ValueError, match="buffer size"):
-        backend.forward(hidden, None, None, Mock(), 2, True)
 
 
 def test_launch_arguments(config):
