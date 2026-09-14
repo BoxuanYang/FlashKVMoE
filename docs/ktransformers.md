@@ -41,7 +41,7 @@ and driver. The commands below use CUDA 12.8 / PyTorch 2.9.1. `nvcc` must be on 
 CPU offload does not eliminate this requirement.
 
 ```bash
-git clone https://github.com/BoxuanYang/FlashKVMoE.git
+git clone --branch codex/qwen3-kt-cpu-moe https://github.com/BoxuanYang/FlashKVMoE.git
 cd FlashKVMoE
 git submodule update --init third_party/ktransformers
 # Only the dependencies needed to build kt-kernel; no SGLang checkout is needed.
