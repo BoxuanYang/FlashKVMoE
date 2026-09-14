@@ -213,9 +213,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
-        choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
+        choices=["auto", "kt"] + SUPPORTED_MOE_BACKENDS.supported_names(),
         help="The MoE backend to use.",
     )
+
+    parser.add_argument("--kt-weight-path", help="CPU expert GGUF file or directory (KT only).")
+    parser.add_argument("--kt-cpuinfer", type=int, default=ServerArgs.kt_cpuinfer)
+    parser.add_argument("--kt-threadpool-count", type=int, default=ServerArgs.kt_threadpool_count)
+    parser.add_argument("--kt-method", choices=["LLAMAFILE"], default=ServerArgs.kt_method)
 
     parser.add_argument(
         "--shell-mode",

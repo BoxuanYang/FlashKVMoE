@@ -4,6 +4,9 @@
 
 # Mini-SGLang
 
+Qwen3-30B-A3B / Qwen3-235B-A22B with GPU attention and KTransformers CPU experts:
+[installation, launch commands and verification](docs/ktransformers.md).
+
 A **lightweight yet high-performance** inference framework for Large Language Models.
 
 ---

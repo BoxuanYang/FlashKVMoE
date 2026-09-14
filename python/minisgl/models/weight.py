@@ -72,7 +72,9 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
-def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+def load_weight(
+    model_path: str, device: torch.device, *, skip_experts: bool = False
+) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     from .config import ModelConfig
@@ -91,6 +93,9 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
             for name in f.keys():
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                    continue
+                # Filter names before get_tensor: CPU experts must never be read onto CUDA.
+                if skip_experts and ".mlp.experts." in name:
                     continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")

@@ -20,6 +20,10 @@ class EngineConfig:
     max_running_req: int = 256
     attention_backend: str = "auto"
     moe_backend: str = "auto"
+    kt_weight_path: str | None = None
+    kt_cpuinfer: int = 128
+    kt_threadpool_count: int = 2
+    kt_method: str = "LLAMAFILE"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

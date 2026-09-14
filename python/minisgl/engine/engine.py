@@ -49,6 +49,11 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if config.moe_backend == "kt":
+            from minisgl.moe.ktransformers import load_ktransformers_experts
+
+            load_ktransformers_experts(self.model, config)
+            logger.info_rank0("KT: all experts on CPU; attention, norms, RoPE and router on GPU")
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # ======================= KV cache initialization ========================
@@ -76,7 +81,7 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
-        if config.model_config.is_moe:
+        if config.model_config.is_moe and config.moe_backend != "kt":
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
@@ -143,7 +148,12 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                k: v.to(self.dtype)
+                for k, v in load_weight(
+                    config.model_path, self.device, skip_experts=config.moe_backend == "kt"
+                )
+            }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
@@ -218,6 +228,26 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.moe_backend == "kt":
+        if config.model_config.architectures != ["Qwen3MoeForCausalLM"]:
+            raise ValueError("KT supports Qwen3 MoE only (30B-A3B / 235B-A22B)")
+        if config.tp_info.size != 1:
+            raise ValueError("KT requires --tp-size 1")
+        if config.dtype != torch.bfloat16:
+            raise ValueError("KT LLAMAFILE requires --dtype bfloat16")
+        if config.use_dummy_weight or not config.kt_weight_path:
+            raise ValueError("KT requires real GGUF weights via --kt-weight-path")
+        if config.kt_method != "LLAMAFILE":
+            raise ValueError("KT supports --kt-method LLAMAFILE only")
+        if not 0 < config.kt_threadpool_count <= config.kt_cpuinfer:
+            raise ValueError("KT requires 0 < kt-threadpool-count <= kt-cpuinfer")
+        if config.max_forward_len <= 0 or config.max_running_req <= 0:
+            raise ValueError("KT requires positive prefill and request limits")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+    elif config.kt_weight_path:
+        raise ValueError("--kt-weight-path requires --moe-backend kt")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

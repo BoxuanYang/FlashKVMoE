@@ -1,0 +1,234 @@
+"""CPU contract tests; the real CUDA/KT numerical test is in test_ktransformers_cuda.py."""
+
+import sys
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+from minisgl.distributed import DistributedInfo
+from minisgl.engine.config import EngineConfig
+from minisgl.engine.engine import _adjust_config
+from minisgl.models import ModelConfig, create_model
+from minisgl.models import weight as weight_module
+from minisgl.moe.ktransformers import KTransformersMoE, load_ktransformers_experts
+from minisgl.server.args import parse_args
+from safetensors.torch import save_file
+from transformers import Qwen3MoeConfig
+
+
+def make_config(**kwargs):
+    config = EngineConfig(
+        model_path="unused",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        moe_backend="kt",
+        kt_weight_path="experts.gguf",
+        attention_backend="fi",
+        **kwargs,
+    )
+    hf = Qwen3MoeConfig(
+        architectures=["Qwen3MoeForCausalLM"],
+        num_hidden_layers=2,
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=512,
+        max_position_embeddings=128,
+    )
+    config.__dict__["model_config"] = ModelConfig.from_hf(hf)
+    return config
+
+
+@pytest.fixture
+def single_rank(monkeypatch):
+    monkeypatch.setattr("minisgl.distributed.info._TP_INFO", DistributedInfo(0, 1))
+
+
+@pytest.fixture
+def wrapper_factory(monkeypatch, single_rank):
+    factory = MagicMock(side_effect=lambda **kwargs: MagicMock())
+    monkeypatch.setitem(sys.modules, "kt_kernel", SimpleNamespace(KTMoEWrapper=factory))
+    return factory
+
+
+@pytest.mark.parametrize("skip_experts", [False, True])
+def test_filter_experts_before_read(tmp_path, monkeypatch, single_rank, skip_experts):
+    config = make_config().model_config
+    monkeypatch.setattr(ModelConfig, "from_hf", lambda _: config)
+    monkeypatch.setattr(weight_module, "cached_load_hf_config", lambda _: None)
+    tensors = {"model.layers.0.mlp.gate.weight": torch.randn(4, 256)}
+    for expert in range(4):
+        for proj in ("gate", "up", "down"):
+            tensors[f"model.layers.0.mlp.experts.{expert}.{proj}_proj.weight"] = torch.randn(
+                256, 256
+            )
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    real_open = weight_module.safetensors.safe_open
+    reads = []
+
+    class CheckedReader:
+        def __init__(self, *args, **kwargs):
+            self.reader = real_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.reader.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.reader.__exit__(*args)
+
+        def keys(self):
+            return self.reader.keys()
+
+        def get_tensor(self, name):
+            reads.append(name)
+            if skip_experts:
+                assert ".experts." not in name
+            return self.reader.get_tensor(name)
+
+    monkeypatch.setattr(weight_module.safetensors, "safe_open", CheckedReader)
+    loaded = dict(
+        weight_module.load_weight(str(tmp_path), torch.device("cpu"), skip_experts=skip_experts)
+    )
+    torch.testing.assert_close(
+        loaded["model.layers.0.mlp.gate.weight"], tensors["model.layers.0.mlp.gate.weight"]
+    )
+    assert len(reads) == (1 if skip_experts else 13)
+    if not skip_experts:
+        packed = loaded["model.layers.0.mlp.experts.gate_up_proj"]
+        for expert in range(4):
+            prefix = f"model.layers.0.mlp.experts.{expert}"
+            torch.testing.assert_close(
+                packed[expert],
+                torch.cat(
+                    [tensors[f"{prefix}.gate_proj.weight"], tensors[f"{prefix}.up_proj.weight"]]
+                ),
+            )
+
+
+@pytest.mark.parametrize(
+    "layers,hidden,intermediate,heads", [(48, 2048, 768, 32), (94, 4096, 1536, 64)]
+)
+def test_full_qwen_shapes_have_no_expert_state(
+    wrapper_factory, monkeypatch, layers, hidden, intermediate, heads
+):
+    config = make_config()
+    config.__dict__["model_config"] = replace(
+        config.model_config,
+        num_layers=layers,
+        hidden_size=hidden,
+        moe_intermediate_size=intermediate,
+        num_qo_heads=heads,
+        num_kv_heads=4,
+        num_experts=128,
+        num_experts_per_tok=8,
+        vocab_size=151936,
+    )
+    monkeypatch.setattr("minisgl.layers.attention.get_rope", lambda **kwargs: None)
+    monkeypatch.setitem(sys.modules, "flashinfer", MagicMock())
+    with torch.device("meta"):
+        model = create_model(config.model_config)
+    before = model.state_dict()
+    load_ktransformers_experts(model, config)
+    after = model.state_dict()
+    assert set(after) == {name for name in before if ".experts." not in name}
+    assert all(after[name] is before[name] for name in after)
+    assert wrapper_factory.call_count == layers
+    for layer_id, call in enumerate(wrapper_factory.call_args_list):
+        assert call.kwargs["layer_idx"] == layer_id
+        assert call.kwargs["gpu_experts_mask"] is None
+        assert call.kwargs["max_deferred_experts_per_token"] == 0
+        assert call.kwargs["moe_intermediate_size"] == intermediate
+
+
+@pytest.mark.parametrize("tokens", [1, 17])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_routing_and_stream_contract(wrapper_factory, monkeypatch, tokens, renormalize):
+    config = make_config(max_seq_len_override=8, max_running_req=32)
+    config.__dict__["model_config"] = replace(config.model_config, norm_topk_prob=renormalize)
+    layer = KTransformersMoE(config, 0)
+    assert wrapper_factory.call_args.kwargs["chunked_prefill_size"] == 32
+    mapping = layer._wrapper.load_weights.call_args.args[0]
+    torch.testing.assert_close(mapping, torch.arange(4, dtype=torch.int32))
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=123)
+    )
+    x = torch.randn(tokens, 256, dtype=torch.bfloat16)
+    logits = torch.tensor([1.0, -2.0, 4.0, 0.0]).expand(tokens, -1)
+    result = layer.forward(x, logits)
+    states, ids, weights, stream = layer._wrapper.forward.call_args.args
+    assert states is x and stream == 123
+    assert result is layer._wrapper.forward.return_value
+    expected_ids = torch.tensor([2, 0]).expand(tokens, -1)
+    expected_weights = logits.softmax(-1).gather(-1, expected_ids)
+    if renormalize:
+        expected_weights /= expected_weights.sum(-1, keepdim=True)
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights)
+    assert weights.dtype == torch.float32
+
+
+def test_kt_disables_graphs():
+    config = make_config(cuda_graph_bs=[1, 2], cuda_graph_max_bs=128)
+    _adjust_config(config)
+    assert config.cuda_graph_bs == [] and config.cuda_graph_max_bs == 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tp_info": DistributedInfo(0, 2)},
+        {"dtype": torch.float16},
+        {"kt_weight_path": None},
+        {"use_dummy_weight": True},
+        {"kt_method": "BF16"},
+        {"kt_cpuinfer": 0},
+        {"kt_threadpool_count": 0},
+        {"max_running_req": 0},
+        {"max_seq_len_override": 0},
+        {"moe_backend": "fused"},
+    ],
+)
+def test_invalid_config_fails_before_loading(changes):
+    config = make_config()
+    for key, value in changes.items():
+        object.__setattr__(config, key, value)
+    with pytest.raises(ValueError):
+        _adjust_config(config)
+
+
+def test_cli():
+    config, _ = parse_args(
+        [
+            "--model",
+            "unused",
+            "--dtype",
+            "bfloat16",
+            "--moe-backend",
+            "kt",
+            "--kt-weight-path",
+            "/models/gguf",
+            "--kt-cpuinfer",
+            "128",
+            "--kt-threadpool-count",
+            "2",
+            "--kt-method",
+            "LLAMAFILE",
+            "--attention-backend",
+            "fi",
+            "--num-pages",
+            "2048",
+            "--page-size",
+            "1",
+        ]
+    )
+    assert config.moe_backend == "kt" and config.kt_weight_path == "/models/gguf"
+    assert config.kt_cpuinfer == 128 and config.kt_threadpool_count == 2
+    assert config.num_page_override * config.page_size == 2048
