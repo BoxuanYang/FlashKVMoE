@@ -4,7 +4,7 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
-from minisgl.layers import BaseOP
+from minisgl.layers import BaseOP, LinearReplicated
 
 if TYPE_CHECKING:
     from minisgl.engine import EngineConfig
@@ -27,18 +27,24 @@ def load_ktransformers_experts(
     # even after an eager prefill uses a different batch size.
     KTMoEWrapper.set_capture_batch_sizes(cuda_graph_bs)
     max_graph_bs = max(cuda_graph_bs, default=0)
-    # Replace meta expert placeholders BEFORE loading any GPU weights.
+    # Replace the entire MLP BEFORE loading GPU weights, retaining its router
+    # under mlp.gate so the Hugging Face checkpoint keys remain unchanged.
     for layer_id, layer in enumerate(model.model.layers.op_list):
-        layer.mlp.experts = KTransformersMoE(config, layer_id, max_graph_bs=max_graph_bs)
+        layer.mlp = KTransformersMoE(
+            config, layer_id, gate=layer.mlp.gate, max_graph_bs=max_graph_bs
+        )
 
 
 class KTransformersMoE(BaseOP):
-    """CPU experts owned by KT; routing and the rest of Qwen3 stay on GPU."""
+    """Complete MoE MLP: GPU router and a direct KT CPU expert wrapper."""
 
-    def __init__(self, config: EngineConfig, layer_id: int, *, max_graph_bs: int = 0):
+    def __init__(
+        self, config: EngineConfig, layer_id: int, *, gate: LinearReplicated, max_graph_bs: int = 0
+    ):
         from kt_kernel import KTMoEWrapper
 
         model = config.model_config
+        self.gate = gate
         self._top_k = model.num_experts_per_tok
         self._renormalize = model.norm_topk_prob
         self._wrapper = KTMoEWrapper(
@@ -58,7 +64,8 @@ class KTransformersMoE(BaseOP):
         )
         self._wrapper.load_weights(torch.arange(model.num_experts, dtype=torch.int32, device="cpu"))
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits = self.gate.forward(hidden_states)
         scores = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
         weights, ids = torch.topk(scores, self._top_k, dim=-1)
         if self._renormalize:

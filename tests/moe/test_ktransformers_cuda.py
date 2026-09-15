@@ -12,6 +12,7 @@ from minisgl.core import Batch, Context, Req, SamplingParams
 from minisgl.distributed import DistributedInfo
 from minisgl.engine.config import EngineConfig
 from minisgl.engine.graph import GraphRunner
+from minisgl.layers import LinearReplicated
 from minisgl.models import ModelConfig
 from minisgl.moe.ktransformers import load_ktransformers_experts
 from transformers import Qwen3MoeConfig
@@ -75,11 +76,16 @@ def kt_experts(tmp_path):
             num_key_value_heads=1,
         )
     )
-    layers = [SimpleNamespace(mlp=SimpleNamespace()) for _ in range(2)]
+    layers = []
+    for _ in range(2):
+        with torch.device("cuda"):
+            gate = LinearReplicated(256, 4, has_bias=False)
+        gate.weight = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16) * 0.02
+        layers.append(SimpleNamespace(mlp=SimpleNamespace(gate=gate)))
     model = SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=layers)))
     load_ktransformers_experts(model, config, [1, 2, 4])
-    experts = [layer.mlp.experts for layer in layers]
-    assert all(not layer.state_dict() for layer in experts)
+    experts = [layer.mlp for layer in layers]
+    assert all(set(layer.state_dict()) == {"gate.weight"} for layer in experts)
     yield experts, references
     torch.cuda.synchronize()
     kt_kernel.KTMoEWrapper.clear_buffer_cache()
@@ -96,7 +102,7 @@ def test_real_gguf_prefill_decode(kt_experts):
         for tokens in (1, 17, 1):
             for layer, (gate, up, down) in zip(experts, references):
                 x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16)
-                logits = torch.randn(tokens, 4, device="cuda", dtype=torch.bfloat16)
+                logits = F.linear(x, layer.gate.weight)
                 scores, ids = logits.float().softmax(-1).topk(2, dim=-1)
                 scores /= scores.sum(-1, keepdim=True)
                 expected = torch.zeros_like(x, dtype=torch.float32)
@@ -106,7 +112,7 @@ def test_real_gguf_prefill_decode(kt_experts):
                     ) @ down[expert].T
                     coefficient = (scores * (ids == expert)).sum(-1, keepdim=True)
                     expected += coefficient * expert_out
-                actual = layer.forward(x, logits)
+                actual = layer.forward(x)
                 assert actual.device == x.device and actual.dtype == x.dtype
                 stream.synchronize()
                 assert torch.isfinite(actual).all()
@@ -136,7 +142,7 @@ def test_real_gguf_graph_replay_after_prefill(kt_experts, monkeypatch):
     def forward():
         x = embedding[ctx.batch.input_ids.long()]
         for layer in experts:
-            x = x + layer.forward(x, x[:, :4].contiguous())
+            x = x + layer.forward(x)
         return x
 
     stream = torch.cuda.Stream()

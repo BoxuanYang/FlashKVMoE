@@ -11,7 +11,9 @@
 
 这里的 CPU MoE 指专家计算；router 是 GPU 上的小矩阵。HF 中的 `.mlp.experts.` 张量在
 `get_tensor()` 之前被过滤，不会先加载到 GPU 再卸载。模型初始化使用 meta tensor，加载前
-将专家占位对象替换成 KT 对象；GPU state dict 中没有专家参数。GGUF 可以包含完整模型，
+将整层 `mlp` 替换为 `KTransformersMoE`，其内部直接完成 GPU router/top-k 并调用 KT
+wrapper，不再经过 `MoEMLP.experts`。原 router 保留为 `mlp.gate`，权重键不变；
+GPU state dict 中没有专家参数。GGUF 可以包含完整模型，
 KT 仅获取 `blk.N.ffn_{gate,up,down}_exps.weight`；文件 mmap 不等于加载非专家参数用于 CPU 计算。
 
 范围限定为单 GPU、BF16 激活、LLAMAFILE、全部专家在 CPU、无 deferred experts。

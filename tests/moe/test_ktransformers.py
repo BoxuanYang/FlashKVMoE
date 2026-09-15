@@ -12,6 +12,7 @@ from minisgl.distributed import DistributedInfo
 from minisgl.engine.config import EngineConfig
 from minisgl.engine.engine import _adjust_config
 from minisgl.engine.graph import GraphRunner, _determine_cuda_graph_bs
+from minisgl.layers import LinearReplicated
 from minisgl.models import ModelConfig, create_model
 from minisgl.models import weight as weight_module
 from minisgl.moe.ktransformers import KTransformersMoE, load_ktransformers_experts
@@ -137,11 +138,16 @@ def test_full_qwen_shapes_have_no_expert_state(
     monkeypatch.setitem(sys.modules, "flashinfer", MagicMock())
     with torch.device("meta"):
         model = create_model(config.model_config)
+    gates = [layer.mlp.gate for layer in model.model.layers.op_list]
     before = model.state_dict()
     load_ktransformers_experts(model, config)
     after = model.state_dict()
     assert set(after) == {name for name in before if ".experts." not in name}
     assert all(after[name] is before[name] for name in after)
+    for layer, gate in zip(model.model.layers.op_list, gates):
+        assert isinstance(layer.mlp, KTransformersMoE)
+        assert layer.mlp.gate is gate
+        assert not hasattr(layer.mlp, "experts")
     assert wrapper_factory.call_count == layers
     for layer_id, call in enumerate(wrapper_factory.call_args_list):
         assert call.kwargs["layer_idx"] == layer_id
@@ -155,7 +161,14 @@ def test_full_qwen_shapes_have_no_expert_state(
 def test_routing_and_stream_contract(wrapper_factory, monkeypatch, tokens, renormalize):
     config = make_config(max_seq_len_override=8, max_running_req=32)
     config.__dict__["model_config"] = replace(config.model_config, norm_topk_prob=renormalize)
-    layer = KTransformersMoE(config, 0)
+    gate = LinearReplicated(256, 4, has_bias=False)
+    gate.weight = torch.empty(4, 256, device="meta", dtype=torch.bfloat16)
+    layer = KTransformersMoE(config, 0, gate=gate)
+    router_weight = torch.zeros(4, 256, dtype=torch.bfloat16)
+    router_weight[:, 0] = torch.tensor([1.0, -2.0, 4.0, 0.0])
+    layer.load_state_dict({"gate.weight": router_weight})
+    assert layer.gate.weight is router_weight
+    assert set(layer.state_dict()) == {"gate.weight"}
     assert wrapper_factory.call_args.kwargs["chunked_prefill_size"] == 32
     mapping = layer._wrapper.load_weights.call_args.args[0]
     torch.testing.assert_close(mapping, torch.arange(4, dtype=torch.int32))
@@ -163,8 +176,9 @@ def test_routing_and_stream_contract(wrapper_factory, monkeypatch, tokens, renor
         torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=123)
     )
     x = torch.randn(tokens, 256, dtype=torch.bfloat16)
+    x[:, 0] = 1
     logits = torch.tensor([1.0, -2.0, 4.0, 0.0]).expand(tokens, -1)
-    result = layer.forward(x, logits)
+    result = layer.forward(x)
     states, ids, weights, stream = layer._wrapper.forward.call_args.args
     assert states is x and stream == 123
     assert result is layer._wrapper.forward.return_value
@@ -249,7 +263,10 @@ def test_graph_selective_replay(phase, size, selected):
 
 def test_kt_graph_buffers_cover_capture_padding(wrapper_factory):
     config = make_config(max_running_req=3, max_seq_len_override=8)
-    layers = [SimpleNamespace(mlp=SimpleNamespace()) for _ in range(2)]
+    layers = [
+        SimpleNamespace(mlp=SimpleNamespace(gate=LinearReplicated(256, 4, has_bias=False)))
+        for _ in range(2)
+    ]
     model = SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=layers)))
     load_ktransformers_experts(model, config, [1, 2, 4, 16])
     wrapper_factory.set_capture_batch_sizes.assert_called_once_with([1, 2, 4, 16])
