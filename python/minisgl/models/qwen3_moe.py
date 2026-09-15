@@ -35,11 +35,13 @@ class Qwen3DecoderLayer(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(x, residual)
-        x = self.self_attn.forward(x)
+        with torch.cuda.nvtx.range(f"Attention_{self._layer_id}"):
+            x = self.self_attn.forward(x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
 
         # type(self.mlp): <class 'minisgl.moe.ktransformers.KTransformersMoE'>
-        x = self.mlp.forward(x)
+        with torch.cuda.nvtx.range(f"MoE_{self._layer_id}"):
+            x = self.mlp.forward(x)
         return x, residual
 
 
