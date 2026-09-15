@@ -194,7 +194,11 @@ CUDA_VISIBLE_DEVICES=2 python -m minisgl \
 
 128 线程、2 个 NUMA pool 沿用原命令，需匹配机器可用的物理核和 NUMA 拓扑（`lscpu`）。
 若使用 `--max-running-requests 100`，可相应设置 `--cuda-graph-max-bs 100`；
-捕获大小为 `1, 2, 4, 8, 16, ..., 96, 100`。首次启动会进行 warmup 和 graph capture，
+捕获大小为 `1, 2, 4, 8, 12, 16, 24, ..., 96, 100`。上限为 24 时列表为
+`[1, 2, 4, 8, 12, 16, 24]`；非标准上限也会加入列表，例如上限 20 会以 `16, 20` 结尾。
+decode 按实际 batch size 选择能容纳它的最小 graph 并 padding，例如 9 个请求重放
+bs=12，17 个请求重放 bs=24；超过捕获上限或处于 prefill 时走 eager。
+首次启动会进行 warmup 和 graph capture，
 需要额外的启动时间与显存；KV cache 仍由 `--num-pages` 和 `--page-size` 决定。
 GPU 仍需容纳全部非专家 BF16 参数：按模型形状估算，30B 约 2.9 GiB，235B 约 14.9 GiB，
 还需额外留出 KV cache、CUDA/FlashInfer 工作区和加载期间的临时空间。CPU RAM 需容纳

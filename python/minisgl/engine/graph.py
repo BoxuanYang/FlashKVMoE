@@ -64,8 +64,8 @@ def _determine_cuda_graph_bs(
     if cuda_graph_max_bs < 1:
         return []
 
-    sizes = [bs for bs in (1, 2, 4) if bs <= cuda_graph_max_bs]
-    sizes.extend(range(8, cuda_graph_max_bs + 1, 8))
+    sizes = [bs for bs in (1, 2, 4, 8, 12) if bs <= cuda_graph_max_bs]
+    sizes.extend(range(16, cuda_graph_max_bs + 1, 8))
     # Include the requested limit even when it is not a multiple of eight.
     return sorted(set(sizes + [cuda_graph_max_bs]))
 

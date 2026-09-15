@@ -7,10 +7,11 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from minisgl.core import Batch
 from minisgl.distributed import DistributedInfo
 from minisgl.engine.config import EngineConfig
 from minisgl.engine.engine import _adjust_config
-from minisgl.engine.graph import _determine_cuda_graph_bs
+from minisgl.engine.graph import GraphRunner, _determine_cuda_graph_bs
 from minisgl.models import ModelConfig, create_model
 from minisgl.models import weight as weight_module
 from minisgl.moe.ktransformers import KTransformersMoE, load_ktransformers_experts
@@ -194,6 +195,56 @@ def test_graph_sizes_respect_requested_limit(limit):
         assert sizes == sorted(set(sizes))
         assert sizes[0] == 1 and sizes[-1] == limit
         assert all(0 < bs <= limit for bs in sizes)
+
+
+@pytest.mark.parametrize(
+    "limit,expected",
+    [
+        (12, [1, 2, 4, 8, 12]),
+        (20, [1, 2, 4, 8, 12, 16, 20]),
+        (24, [1, 2, 4, 8, 12, 16, 24]),
+        (32, [1, 2, 4, 8, 12, 16, 24, 32]),
+        (100, [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 100]),
+    ],
+)
+def test_graph_capture_schedule(limit, expected):
+    assert _determine_cuda_graph_bs(None, limit, 0) == expected
+
+
+@pytest.mark.parametrize(
+    "phase,size,selected",
+    [
+        ("decode", 3, 4),
+        ("decode", 9, 12),
+        ("decode", 12, 12),
+        ("decode", 17, 24),
+        ("decode", 25, None),
+        ("prefill", 9, None),
+    ],
+)
+def test_graph_selective_replay(phase, size, selected):
+    runner = GraphRunner.__new__(GraphRunner)
+    runner.graph_bs_list = _determine_cuda_graph_bs(None, 24, 0)
+    runner.max_graph_bs = 24
+    runner.dummy_req = object()
+    runner.graph_map = {bs: MagicMock() for bs in runner.graph_bs_list}
+    runner.buffer = MagicMock(logits=torch.zeros(24, 2))
+    runner.attn_backend = MagicMock()
+    batch = Batch(reqs=[object() for _ in range(size)], phase=phase)
+    runner.pad_batch(batch)
+    assert batch.padded_reqs[:size] == batch.reqs
+    if selected is None:
+        assert not runner.can_use_cuda_graph(batch)
+        assert batch.padded_size == size
+    else:
+        assert runner.can_use_cuda_graph(batch)
+        assert batch.padded_size == selected
+        assert all(req is runner.dummy_req for req in batch.padded_reqs[size:])
+        assert runner.replay(batch).shape == (size, 2)
+        runner.buffer.copy_from.assert_called_once_with(batch)
+        runner.attn_backend.prepare_for_replay.assert_called_once_with(batch)
+    for bs, graph in runner.graph_map.items():
+        assert graph.replay.call_count == int(bs == selected)
 
 
 def test_kt_graph_buffers_cover_capture_padding(wrapper_factory):
