@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
-        CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     )
     from minisgl.models import ModelConfig
 
@@ -93,13 +92,13 @@ class FlashInferBackend(BaseAttnBackend):
         self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
+            backend="fa2",
         )
         self.decode_wrappers = BatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             use_tensor_cores=self.use_tensor_cores,
             kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
+            backend="fa2",
         )
 
         # NOTE: some hack to reuse the int_workspace_buffer
@@ -115,7 +114,7 @@ class FlashInferBackend(BaseAttnBackend):
         # for cuda graph
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
+        self.graph_wrappers: Dict[int, BatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
@@ -242,20 +241,22 @@ class FlashInferBackend(BaseAttnBackend):
         return GQA >= 4
 
     def prepare_for_capture(self, batch: Batch) -> None:
-        from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         bs = batch.size
         assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
         capture = self.capture
-        self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+        # Use the same public graph API as KTransformers' FlashInfer backend.
+        self.graph_wrappers[bs] = BatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
+            backend="fa2",
+            use_cuda_graph=True,
             use_tensor_cores=self.use_tensor_cores,
-            indptr_buffer=capture.cu_seqlens_k[: bs + 1],
-            indices_buffer=capture.indices,
-            last_page_len_buffer=capture.one_tensor[:bs],
+            paged_kv_indptr_buffer=capture.cu_seqlens_k[: bs + 1],
+            paged_kv_indices_buffer=capture.indices,
+            paged_kv_last_page_len_buffer=capture.one_tensor[:bs],
         )
-        self.graph_wrappers[bs]._backend = "fa2"
         self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
