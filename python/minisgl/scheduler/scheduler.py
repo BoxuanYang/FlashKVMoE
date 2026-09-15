@@ -45,6 +45,12 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
+        # import debugpy
+
+        # debugpy.listen(("0.0.0.0", 5678))
+        # print("Scheduler waiting for debugger...")
+        # debugpy.wait_for_client()
+
         from minisgl.engine import Engine
 
         self.engine = Engine(config)
@@ -98,6 +104,7 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        # forward_input： scheduler.ForwardInput
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -126,11 +133,13 @@ class Scheduler(SchedulerIOMixin):
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
+                    print("normal loop")
                     self.normal_loop()
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
+                print("overlap loop")
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:

@@ -69,6 +69,8 @@ class MoEMLP(BaseOP):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
+
+
         final_hidden_states = self.experts.forward(
             hidden_states=hidden_states, router_logits=router_logits
         )

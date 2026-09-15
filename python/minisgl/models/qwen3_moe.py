@@ -37,6 +37,8 @@ class Qwen3DecoderLayer(BaseOP):
         x, residual = self.input_layernorm.forward(x, residual)
         x = self.self_attn.forward(x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
+
+        # type(self.mlp): <class 'minisgl.moe.ktransformers.KTransformersMoE'>
         x = self.mlp.forward(x)
         return x, residual
 

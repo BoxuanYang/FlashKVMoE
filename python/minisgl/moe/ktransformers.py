@@ -70,6 +70,8 @@ class KTransformersMoE(BaseOP):
         weights, ids = torch.topk(scores, self._top_k, dim=-1)
         if self._renormalize:
             weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        # type(self._wrapper): <class 'kt_kernel.utils.llamafile.LlamafileMoEWrapper'> 
         return self._wrapper.forward(
             hidden_states,
             ids,
