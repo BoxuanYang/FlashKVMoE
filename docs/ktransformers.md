@@ -15,7 +15,11 @@
 KT 仅获取 `blk.N.ffn_{gate,up,down}_exps.weight`；文件 mmap 不等于加载非专家参数用于 CPU 计算。
 
 范围限定为单 GPU、BF16 激活、LLAMAFILE、全部专家在 CPU、无 deferred experts。
-KT 模式自动禁用 CUDA graph。其他模型/精度/TP 配置会报错。
+KT 模式支持 decode CUDA graph，prefill 仍走 eager。其他模型/精度/TP 配置会报错。
+`--cuda-graph-max-bs N` 指定捕获的最大 batch size（包含 N 本身），`0` 显式关闭。
+捕获前会注册 KT 的固定 CPU/GPU 缓冲区，CPU 专家通过 CUDA host callback 在每次 replay
+时重新执行；内部专家缓冲区包含 graph padding 所需容量。开启 graph 时不能设置
+`KT_FORCE_SYNC_SUBMIT=1`，否则启动报错，避免 CPU 计算只在 capture 时执行。
 
 ## 1. 克隆与安装
 
@@ -130,10 +134,12 @@ CUDA_VISIBLE_DEVICES=2 python -m pytest tests/moe -o addopts= -v
 CPU 测试检查读取前过滤专家、原 GPU 后端的专家合并、两种模型的全部层结构、路由、stream
 和配置约束。`test_ktransformers_cuda.py` 在 Linux CUDA 上创建两层小型 Q8_0 GGUF，运行
 真实 KT LLAMAFILE，比较 PyTorch 反量化参考计算，并测试非默认 stream 和 decode/prefill/
-decode 的 batch 大小切换。该测试不需要下载完整模型。在 Linux CUDA 机器上 KT 导入失败
+decode 的 batch 大小切换。GraphRunner 测试还覆盖多种捕获大小、padding、改变输入后的
+重复 replay，以及 eager prefill 后的 graph replay，与 eager 输出比较。
+该测试不需要下载完整模型。在 Linux CUDA 机器上 KT 导入失败
 会导致测试失败；没有 Linux CUDA 时该项会跳过。
 
-开发环境实测：20 项 CPU 测试通过；真实 CUDA/KT 测试因 Windows CPU 环境跳过。
+真实 CUDA/KT 测试需要在 Linux GPU 环境运行；Windows CPU 环境会跳过。
 30B/235B 整模型生成尚未实机验证，不能把上述测试当作完整模型的运行或性能保证。
 
 ## 4. 启动 30B
@@ -152,7 +158,7 @@ CUDA_VISIBLE_DEVICES=2 python -m minisgl \
   --kt-threadpool-count 2 \
   --kt-method LLAMAFILE \
   --attention-backend fi \
-  --cuda-graph-max-bs 0 \
+  --cuda-graph-max-bs 4 \
   --page-size 1 \
   --num-pages 2048 \
   --max-seq-len-override 2048 \
@@ -178,7 +184,7 @@ CUDA_VISIBLE_DEVICES=2 python -m minisgl \
   --kt-threadpool-count 2 \
   --kt-method LLAMAFILE \
   --attention-backend fi \
-  --cuda-graph-max-bs 0 \
+  --cuda-graph-max-bs 4 \
   --page-size 1 \
   --num-pages 2048 \
   --max-seq-len-override 2048 \
@@ -187,6 +193,9 @@ CUDA_VISIBLE_DEVICES=2 python -m minisgl \
 ```
 
 128 线程、2 个 NUMA pool 沿用原命令，需匹配机器可用的物理核和 NUMA 拓扑（`lscpu`）。
+若使用 `--max-running-requests 100`，可相应设置 `--cuda-graph-max-bs 100`；
+捕获大小为 `1, 2, 4, 8, 16, ..., 96, 100`。首次启动会进行 warmup 和 graph capture，
+需要额外的启动时间与显存；KV cache 仍由 `--num-pages` 和 `--page-size` 决定。
 GPU 仍需容纳全部非专家 BF16 参数：按模型形状估算，30B 约 2.9 GiB，235B 约 14.9 GiB，
 还需额外留出 KV cache、CUDA/FlashInfer 工作区和加载期间的临时空间。CPU RAM 需容纳
 GGUF 专家及 KT NUMA 权重布局和工作区，不能仅按 GPU 显存判断 235B 能否启动。
@@ -197,12 +206,12 @@ GGUF 专家及 KT NUMA 权重布局和工作区，不能仅按 GPU 显存判断 
 | --- | --- |
 | `python -m sglang.launch_server` | `python -m minisgl` |
 | `--attention-backend flashinfer` | `--attention-backend fi` |
-| `--disable-cuda-graph` | `--cuda-graph-max-bs 0`；KT 模式也会自动关闭 |
+| `--disable-cuda-graph` | `--cuda-graph-max-bs 0`；KT 模式同样遵循此参数 |
 | `--max-total-tokens 2048` | `--page-size 1 --num-pages 2048`，另有 1 个内部 dummy page |
 | `--mem-fraction-static 0.5` | `--memory-ratio 0.5`；但显式 `--num-pages` 会覆盖自动预算，因此上面省略 |
 | `--kt-num-gpu-experts 0` | 固定为 0，无需参数 |
 | `--kt-max-deferred-experts-per-token 0` | 固定为 0，无需参数 |
-| `--watchdog-timeout`、`--skip-server-warmup` | 没有对应参数；上述禁用 graph 的启动流程不会做 graph warmup |
+| `--watchdog-timeout`、`--skip-server-warmup` | 没有对应参数；启用 graph 时会执行 graph warmup |
 
 ## 6. 请求验证
 
@@ -222,7 +231,9 @@ curl --fail-with-body http://127.0.0.1:30000/v1/chat/completions \
 
 235B 请求将 `model` 改为 `/data2/models/Qwen3-235B-A22B`。启动日志应出现
 `KT: all experts on CPU; attention, norms, RoPE and router on GPU`、2048-token KV cache
-和 `CUDA graph is disabled.`。成功请求才完成整模型 smoke test；测试跳过不算验收通过。
+和 `Start capturing CUDA graphs with sizes: [1, 2, 4]`（上述示例配置）。
+只有显式关闭 graph 时才应出现 `CUDA graph is disabled.`。
+成功请求才完成整模型 smoke test；测试跳过不算验收通过。
 
 实现入口：`python/minisgl/moe/ktransformers.py`，权重过滤在
 `python/minisgl/models/weight.py`，接线与约束在 `python/minisgl/engine/engine.py`。

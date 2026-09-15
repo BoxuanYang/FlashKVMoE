@@ -14,7 +14,7 @@ from minisgl.moe import create_moe_backend
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory, mem_GB
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
 
 logger = init_logger(__name__)
@@ -44,6 +44,9 @@ class Engine:
         self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
+        cuda_graph_bs = _determine_cuda_graph_bs(
+            config.cuda_graph_bs, config.cuda_graph_max_bs, init_free_memory
+        )
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -52,7 +55,7 @@ class Engine:
         if config.moe_backend == "kt":
             from minisgl.moe.ktransformers import load_ktransformers_experts
 
-            load_ktransformers_experts(self.model, config)
+            load_ktransformers_experts(self.model, config, cuda_graph_bs)
             logger.info_rank0("KT: all experts on CPU; attention, norms, RoPE and router on GPU")
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
@@ -106,7 +109,7 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
@@ -244,8 +247,6 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("KT requires 0 < kt-threadpool-count <= kt-cpuinfer")
         if config.max_forward_len <= 0 or config.max_running_req <= 0:
             raise ValueError("KT requires positive prefill and request limits")
-        override("cuda_graph_bs", [])
-        override("cuda_graph_max_bs", 0)
     elif config.kt_weight_path:
         raise ValueError("--kt-weight-path requires --moe-backend kt")
 

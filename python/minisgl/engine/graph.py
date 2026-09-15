@@ -64,7 +64,10 @@ def _determine_cuda_graph_bs(
     if cuda_graph_max_bs < 1:
         return []
 
-    return [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    sizes = [bs for bs in (1, 2, 4) if bs <= cuda_graph_max_bs]
+    sizes.extend(range(8, cuda_graph_max_bs + 1, 8))
+    # Include the requested limit even when it is not a multiple of eight.
+    return sorted(set(sizes + [cuda_graph_max_bs]))
 
 
 def mem_GB(size: int) -> str:
@@ -137,6 +140,8 @@ class GraphRunner:
             self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
+                # Finish warmup (including CPU expert callbacks) before capture.
+                self.stream.synchronize()
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
             if pool is None:

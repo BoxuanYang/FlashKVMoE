@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,16 +11,31 @@ if TYPE_CHECKING:
     from minisgl.models.qwen3_moe import Qwen3MoeForCausalLM
 
 
-def load_ktransformers_experts(model: Qwen3MoeForCausalLM, config: EngineConfig) -> None:
+def load_ktransformers_experts(
+    model: Qwen3MoeForCausalLM, config: EngineConfig, cuda_graph_bs: list[int] | None = None
+) -> None:
+    from kt_kernel import KTMoEWrapper
+
+    cuda_graph_bs = cuda_graph_bs or []
+    if cuda_graph_bs and os.environ.get("KT_FORCE_SYNC_SUBMIT") == "1":
+        raise ValueError(
+            "KT CUDA graphs require stream callbacks; unset KT_FORCE_SYNC_SUBMIT "
+            "or use --cuda-graph-max-bs 0"
+        )
+    # Warmup allocates these pinned CPU/GPU buffers. KT retains each size so
+    # captured D2H, CPU callbacks and H2D keep valid addresses during replay,
+    # even after an eager prefill uses a different batch size.
+    KTMoEWrapper.set_capture_batch_sizes(cuda_graph_bs)
+    max_graph_bs = max(cuda_graph_bs, default=0)
     # Replace meta expert placeholders BEFORE loading any GPU weights.
     for layer_id, layer in enumerate(model.model.layers.op_list):
-        layer.mlp.experts = KTransformersMoE(config, layer_id)
+        layer.mlp.experts = KTransformersMoE(config, layer_id, max_graph_bs=max_graph_bs)
 
 
 class KTransformersMoE(BaseOP):
     """CPU experts owned by KT; routing and the rest of Qwen3 stay on GPU."""
 
-    def __init__(self, config: EngineConfig, layer_id: int):
+    def __init__(self, config: EngineConfig, layer_id: int, *, max_graph_bs: int = 0):
         from kt_kernel import KTMoEWrapper
 
         model = config.model_config
@@ -35,8 +51,8 @@ class KTransformersMoE(BaseOP):
             cpuinfer_threads=config.kt_cpuinfer,
             threadpool_count=config.kt_threadpool_count,
             weight_path=config.kt_weight_path,
-            # Decode can have more tokens than a configured prefill chunk.
-            chunked_prefill_size=max(config.max_forward_len, config.max_running_req),
+            # Include graph padding and warmup sizes in the C++ buffer capacity.
+            chunked_prefill_size=max(config.max_forward_len, config.max_running_req, max_graph_bs),
             method=config.kt_method,
             max_deferred_experts_per_token=0,
         )

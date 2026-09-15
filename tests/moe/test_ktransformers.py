@@ -10,6 +10,7 @@ import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.engine.config import EngineConfig
 from minisgl.engine.engine import _adjust_config
+from minisgl.engine.graph import _determine_cuda_graph_bs
 from minisgl.models import ModelConfig, create_model
 from minisgl.models import weight as weight_module
 from minisgl.moe.ktransformers import KTransformersMoE, load_ktransformers_experts
@@ -175,10 +176,44 @@ def test_routing_and_stream_contract(wrapper_factory, monkeypatch, tokens, renor
     assert weights.dtype == torch.float32
 
 
-def test_kt_disables_graphs():
-    config = make_config(cuda_graph_bs=[1, 2], cuda_graph_max_bs=128)
+@pytest.mark.parametrize(
+    "sizes,limit", [(None, 100), ([1, 2], 128), (None, 0), ([], 128), (None, None)]
+)
+def test_kt_preserves_graph_settings(sizes, limit):
+    config = make_config(cuda_graph_bs=sizes, cuda_graph_max_bs=limit)
     _adjust_config(config)
-    assert config.cuda_graph_bs == [] and config.cuda_graph_max_bs == 0
+    assert config.cuda_graph_bs == sizes and config.cuda_graph_max_bs == limit
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 3, 4, 7, 8, 17, 100])
+def test_graph_sizes_respect_requested_limit(limit):
+    sizes = _determine_cuda_graph_bs(None, limit, 0)
+    if limit == 0:
+        assert sizes == []
+    else:
+        assert sizes == sorted(set(sizes))
+        assert sizes[0] == 1 and sizes[-1] == limit
+        assert all(0 < bs <= limit for bs in sizes)
+
+
+def test_kt_graph_buffers_cover_capture_padding(wrapper_factory):
+    config = make_config(max_running_req=3, max_seq_len_override=8)
+    layers = [SimpleNamespace(mlp=SimpleNamespace()) for _ in range(2)]
+    model = SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=layers)))
+    load_ktransformers_experts(model, config, [1, 2, 4, 16])
+    wrapper_factory.set_capture_batch_sizes.assert_called_once_with([1, 2, 4, 16])
+    assert wrapper_factory.call_count == 2
+    assert all(call.kwargs["chunked_prefill_size"] == 16 for call in wrapper_factory.call_args_list)
+
+
+def test_kt_graph_rejects_synchronous_submit(wrapper_factory, monkeypatch):
+    monkeypatch.setenv("KT_FORCE_SYNC_SUBMIT", "1")
+    model = SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[])))
+    with pytest.raises(ValueError, match="KT_FORCE_SYNC_SUBMIT"):
+        load_ktransformers_experts(model, make_config(), [1])
+    wrapper_factory.assert_not_called()
+    # The explicit eager mode remains usable with this debugging override.
+    load_ktransformers_experts(model, make_config(), [])
 
 
 @pytest.mark.parametrize(
@@ -227,8 +262,11 @@ def test_cli():
             "2048",
             "--page-size",
             "1",
+            "--cuda-graph-max-bs",
+            "100",
         ]
     )
     assert config.moe_backend == "kt" and config.kt_weight_path == "/models/gguf"
     assert config.kt_cpuinfer == 128 and config.kt_threadpool_count == 2
     assert config.num_page_override * config.page_size == 2048
+    assert config.cuda_graph_max_bs == 100
