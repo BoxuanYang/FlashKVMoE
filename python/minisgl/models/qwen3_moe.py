@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 from minisgl.core import get_global_ctx
-from minisgl.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
+from minisgl.layers import BaseOP, OPList, RMSNormFused, VocabParallelEmbedding
+from minisgl.layers.marlin import MarlinLinear
 from minisgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
@@ -18,6 +19,12 @@ if TYPE_CHECKING:
 class Qwen3DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
+        self.self_attn.qkv_proj = MarlinLinear(
+            config.hidden_size, (config.num_qo_heads + 2 * config.num_kv_heads) * config.head_dim
+        )
+        self.self_attn.o_proj = MarlinLinear(
+            config.num_qo_heads * config.head_dim, config.hidden_size
+        )
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
@@ -70,16 +77,14 @@ class Qwen3Model(BaseOP):
 class Qwen3MoeForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3Model(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-        )
+        self.lm_head = MarlinLinear(config.hidden_size, config.vocab_size)
         super().__init__()
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            output = output[batch.attn_metadata.get_last_indices(batch.size)].contiguous()
         logits = self.lm_head.forward(output)
         return logits
 

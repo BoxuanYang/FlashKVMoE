@@ -6,8 +6,8 @@ HF 目录或仓库只提供 config 和 tokenizer 等小文件，无需下载 saf
 
 | 部分 | 计算位置 | 权重来源 |
 | --- | --- | --- |
-| Attention Q/K/V/O、Q/K norm、两个 decoder norm、最终 norm | GPU | GGUF，加载时反量化为 BF16 |
-| Embedding、LM head、router 与 top-k | GPU | GGUF，加载时反量化为 BF16 |
+| Attention Q/K/V/O、LM head | GPU | GGUF 在 CPU 转为 Marlin INT4，group size 64，GEMM 内融合解量化 |
+| Embedding、Q/K norm、decoder norm、最终 norm、router | GPU | GGUF，加载时反量化为 BF16 |
 | RoPE | GPU | HF config |
 | 所有层、所有 MoE 专家的 gate/up/down 投影与激活 | CPU | KT 加载 GGUF |
 
@@ -23,15 +23,23 @@ KT 从同一路径获取 `blk.N.ffn_{gate,up,down}_exps.weight`，保持专家�
 不递归查找。启动时检查模型架构、必需张量、形状、关键配置及分片完整性。
 `--model` 只提供 config 和 tokenizer，不从该路径加载模型权重。
 
-GPU 权重按行分块反量化，避免 embedding/LM head 的完整 FP32 临时副本；转换为 BF16 后
-Q/K/V 按顺序合并，继续使用现有 Q/K norm、RoPE、FlashInfer 和 BF16 KV cache。
+Q/K/V 按顺序合并，QKV/O/LM head 在 CPU 解量化后重新量化为 INT4，只把压缩权重和
+BF16 scale 传到 GPU。CPU 量化临时空间限制为每次 1024 个输出行，CPU 上仍短暂保留当前
+投影的完整 BF16 张量；GPU 不保留这些投影的 BF16 副本。prefill 和 decode 均使用 Marlin，
+继续使用现有 Q/K norm、RoPE、FlashInfer 和 BF16 KV cache。
 Qwen3 MoE 的 Q/K 权重无需 Llama 式排列还原，参见
 [llama.cpp 的 Qwen3 MoE 转换实现](https://github.com/ggml-org/llama.cpp/blob/master/conversion/qwen.py)。
-此方案节省下载量和磁盘空间，GPU 常驻权重仍是 BF16，量化误差不会因反量化而消失。
+GGUF 的 Q4_K 等布局不能直接交给 Marlin；此次重新量化会增加误差，不能保证与原 BF16
+投影数值完全相同。GGUF 解码复用 `gguf` 库，没有新增量化格式解码器。
 CPU 测试覆盖 F32/F16/BF16、Q8_0、Q4_0、Q4_K、Q6_K GPU 张量；其他类型取决于
 `gguf` 库的反量化实现，不支持的类型会报告具体张量和量化类型。专家类型仍受 KT 限制。
 
 范围限定为单 GPU、BF16 激活、LLAMAFILE、全部专家在 CPU、无 deferred experts。
+Qwen3 的 `qwen3_moe.py` 直接使用 `MarlinLinear`。它只保留 INT4/group-64 的打包和
+MiniSGL BaseOP 适配；CUDA 源文件直接来自固定 KT 子模块的
+`archive/csrc/ktransformers_ext/cuda/gptq_marlin`，首次启动由 PyTorch JIT 编译并缓存。
+无需安装 archive 的 Python 包或旧版 `cpuinfer_ext`，也不复制 CUDA 内核。
+必须保留源码 checkout，按下方命令使用 editable 安装，且启动时能找到 nvcc、C++ 编译器和 ninja。
 KT 模式支持 decode CUDA graph，prefill 仍走 eager。其他模型/精度/TP 配置会报错。
 `--cuda-graph-max-bs N` 指定捕获的最大 batch size（包含 N 本身），`0` 显式关闭。
 捕获前会注册 KT 的固定 CPU/GPU 缓冲区，CPU 专家通过 CUDA host callback 在每次 replay
@@ -149,12 +157,14 @@ hf download Qwen/Qwen3-235B-A22B-GGUF \
 在仓库根目录执行：
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 python -m pytest tests/models/test_gguf.py tests/moe -o addopts= -v
+CUDA_VISIBLE_DEVICES=2 python -m pytest tests/models/test_marlin.py tests/models/test_gguf.py tests/moe -o addopts= -v
 ```
 
 CPU 测试检查 GGUF 专家不进入 GPU state dict、两种模型的全部层结构、路由、stream
 和配置约束。`test_gguf.py` 写入真实混合量化 GGUF，验证完整非专家 state dict、
 QKV 数值和顺序、分片、缺失/重复张量、配置不匹配、绑定 embedding，以及不下载 HF 权重。
+`test_marlin.py` 与 archive 原函数逐位比较 INT4 打包和 scale 排列，并检查全零分组和 padding。
+其 CUDA 测试覆盖两种 Qwen3 的投影形状、LM head 输出维度、不同 batch size 和改变输入后的 graph replay。
 其 CUDA 测试运行真实 QKV/norm/RoPE/FlashInfer/O 投影，比较 PyTorch SDPA 参考，覆盖
 prefill、连续 decode、有 KV cache 的 extend prefill 与随后 decode。
 `test_ktransformers_cuda.py` 在 Linux CUDA 上创建两层小型 Q8_0 GGUF，运行
@@ -225,8 +235,9 @@ decode 按实际 batch size 选择能容纳它的最小 graph 并 padding，例�
 bs=12，17 个请求重放 bs=24；超过捕获上限或处于 prefill 时走 eager。
 首次启动会进行 warmup 和 graph capture，
 需要额外的启动时间与显存；KV cache 仍由 `--num-pages` 和 `--page-size` 决定。
-GPU 仍需容纳全部非专家 BF16 参数：按模型形状估算，30B 约 2.9 GiB，235B 约 14.9 GiB，
-还需额外留出 KV cache、CUDA/FlashInfer 工作区和加载期间的临时空间。CPU RAM 需容纳
+按模型形状估算，GPU 常驻权重从原 BF16 的约 2.9/14.9 GiB 降至 30B 约 1.21 GiB、
+235B 约 4.88 GiB（含 INT4 权重、scale 以及 BF16 embedding/norm/router）。这不是运行峰值；
+还需额外留出 KV cache、CUDA/FlashInfer 工作区、激活和 CUDA graph 空间。CPU RAM 需容纳
 GGUF 专家及 KT NUMA 权重布局和工作区，不能仅按 GPU 显存判断 235B 能否启动。
 
 与原 SGLang 命令的对应关系：

@@ -16,6 +16,7 @@ from minisgl.layers import LinearReplicated
 from minisgl.models import ModelConfig, create_model
 from minisgl.moe.ktransformers import KTransformersMoE, load_ktransformers_experts
 from minisgl.server.args import parse_args
+from minisgl.utils import torch_dtype
 from transformers import Qwen3MoeConfig
 
 
@@ -79,7 +80,7 @@ def test_full_qwen_shapes_have_no_expert_state(
     )
     monkeypatch.setattr("minisgl.layers.attention.get_rope", lambda **kwargs: None)
     monkeypatch.setitem(sys.modules, "flashinfer", MagicMock())
-    with torch.device("meta"):
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
         model = create_model(config.model_config)
     gates = [layer.mlp.gate for layer in model.model.layers.op_list]
     before = model.state_dict()
@@ -87,6 +88,9 @@ def test_full_qwen_shapes_have_no_expert_state(
     after = model.state_dict()
     assert set(after) == {name for name in before if ".experts." not in name}
     assert all(after[name] is before[name] for name in after)
+    # The full target model's GPU weight storage must leave room on a 24 GiB card.
+    weight_bytes = sum(t.numel() * t.element_size() for t in after.values())
+    assert weight_bytes < (1.3 if layers == 48 else 5.0) * 1024**3
     for layer, gate in zip(model.model.layers.op_list, gates):
         assert isinstance(layer.mlp, KTransformersMoE)
         assert layer.mlp.gate is gate

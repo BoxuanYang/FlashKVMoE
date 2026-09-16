@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
     "accelerate",
     "gguf>=0.17.0",
+    "ninja",
     "msgpack",
     "modelscope",
     "torch<2.10.0",

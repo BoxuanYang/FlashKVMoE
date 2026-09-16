@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from minisgl.distributed import DistributedInfo
 from minisgl.engine.config import EngineConfig
 from minisgl.engine.engine import Engine, _adjust_config
+from minisgl.layers.marlin import MarlinLinear, pack_marlin
 from minisgl.models import ModelConfig, create_model
 from minisgl.models.gguf import GGUFWeights
 from minisgl.moe.ktransformers import load_ktransformers_experts
@@ -139,13 +140,14 @@ def test_mixed_gguf_loads_complete_gpu_state(checkpoint, config, monkeypatch):
     monkeypatch.setattr(gguf, "dequantize", checked_dequantize)
     state = dict(reader.weights(torch.device("cpu"), torch.bfloat16, chunk_bytes=4 * 256 * 7))
     assert max(chunk_rows) <= 7
-    assert len(state) == 3 + 2 * 7
-    assert all(t.dtype == torch.bfloat16 and t.is_contiguous() for t in state.values())
+    assert len(state) == 4 + 2 * 9
+    assert all(t.is_contiguous() for t in state.values())
     assert not any("experts" in name for name in state)
-    torch.testing.assert_close(state["model.layers.0.self_attn.qkv_proj.weight"], expected_qkv)
+    qkv_weight, qkv_scales = pack_marlin(expected_qkv)
+    torch.testing.assert_close(state["model.layers.0.self_attn.qkv_proj.weight"], qkv_weight)
+    torch.testing.assert_close(state["model.layers.0.self_attn.qkv_proj.scales"], qkv_scales)
     for layer in range(2):
         for source, target in (
-            ("attn_output", "self_attn.o_proj"),
             ("attn_q_norm", "self_attn.q_norm"),
             ("attn_k_norm", "self_attn.k_norm"),
             ("attn_norm", "input_layernorm"),
@@ -156,10 +158,21 @@ def test_mixed_gguf_loads_complete_gpu_state(checkpoint, config, monkeypatch):
                 state[f"model.layers.{layer}.{target}.weight"],
                 reference(tensors, f"blk.{layer}.{source}.weight"),
             )
+        expected_weight, expected_scales = pack_marlin(
+            reference(tensors, f"blk.{layer}.attn_output.weight")
+        )
+        torch.testing.assert_close(
+            state[f"model.layers.{layer}.self_attn.o_proj.weight"], expected_weight
+        )
+        torch.testing.assert_close(
+            state[f"model.layers.{layer}.self_attn.o_proj.scales"], expected_scales
+        )
     torch.testing.assert_close(
         state["model.embed_tokens.weight"], reference(tensors, "token_embd.weight")
     )
-    torch.testing.assert_close(state["lm_head.weight"], reference(tensors, "output.weight"))
+    head, head_scales = pack_marlin(reference(tensors, "output.weight"))
+    torch.testing.assert_close(state["lm_head.weight"], head)
+    torch.testing.assert_close(state["lm_head.scales"], head_scales)
 
     # Actual runtime model must accept every key/shape/dtype, not just our reference mapping.
     monkeypatch.setitem(sys.modules, "flashinfer", MagicMock())
@@ -171,10 +184,10 @@ def test_mixed_gguf_loads_complete_gpu_state(checkpoint, config, monkeypatch):
     load_ktransformers_experts(model, engine_config(config, path))
     assert all(call.kwargs["weight_path"] == str(path) for call in factory.call_args_list)
     model.load_state_dict(state.copy())
-    x = torch.randn(3, 256, dtype=torch.bfloat16)
-    torch.testing.assert_close(
-        model.model.layers.op_list[0].self_attn.qkv_proj.forward(x), F.linear(x, expected_qkv)
-    )
+    projection = model.model.layers.op_list[0].self_attn.qkv_proj
+    assert isinstance(projection, MarlinLinear) and isinstance(model.lm_head, MarlinLinear)
+    assert projection.weight.dtype == torch.int32
+    torch.testing.assert_close(projection.weight, qkv_weight)
 
 
 @pytest.mark.parametrize("quant", [Q.Q4_K, Q.Q6_K])
@@ -193,10 +206,10 @@ def test_k_quantized_gpu_weights(tmp_path, config, quant):
     path = tmp_path / "k_quant.gguf"
     write_checkpoint(path, tensors)
     state = dict(GGUFWeights(str(path), config).weights(torch.device("cpu"), torch.bfloat16))
-    torch.testing.assert_close(
-        state["model.layers.0.self_attn.qkv_proj.weight"][:256],
-        reference(tensors, "blk.0.attn_q.weight"),
-    )
+    expected = torch.cat([reference(tensors, f"blk.0.attn_{p}.weight") for p in ("q", "k", "v")])
+    packed, scales = pack_marlin(expected)
+    torch.testing.assert_close(state["model.layers.0.self_attn.qkv_proj.weight"], packed)
+    torch.testing.assert_close(state["model.layers.0.self_attn.qkv_proj.scales"], scales)
 
 
 def test_engine_loads_gguf_weights(checkpoint, config):
@@ -215,7 +228,7 @@ def test_shards_and_missing_shard(tmp_path, config):
     for index in range(2):
         write_checkpoint(tmp_path / f"part-{index}.gguf", dict(entries[index::2]), split=(index, 2))
     state = dict(GGUFWeights(str(tmp_path), config).weights(torch.device("cpu"), torch.bfloat16))
-    assert len(state) == 17
+    assert len(state) == 22
     with pytest.raises(ValueError, match="Incomplete GGUF shards"):
         GGUFWeights(str(tmp_path / "part-0.gguf"), config)
 
@@ -256,7 +269,9 @@ def test_tied_embeddings_need_no_output_tensor(tmp_path, config):
     path = tmp_path / "tied.gguf"
     write_checkpoint(path, checkpoint_tensors(config))
     state = dict(GGUFWeights(str(path), config).weights(torch.device("cpu"), torch.bfloat16))
-    assert "lm_head.weight" not in state
+    packed, scales = pack_marlin(state["model.embed_tokens.weight"])
+    torch.testing.assert_close(state["lm_head.weight"], packed)
+    torch.testing.assert_close(state["lm_head.scales"], scales)
     assert "model.embed_tokens.weight" in state
 
 
@@ -314,7 +329,8 @@ def test_gguf_flashinfer_prefill_decode(checkpoint, config, monkeypatch):
     from minisgl.attention.fi import FlashInferBackend
     from minisgl.kvcache import create_kvcache_pool
     from minisgl.layers import set_rope_device
-    from minisgl.models.utils import RopeAttn
+    from minisgl.models.qwen3_moe import Qwen3DecoderLayer
+    from test_marlin import quantized_reference
 
     if not torch.cuda.is_bf16_supported():
         pytest.skip("requires BF16 GPU")
@@ -328,8 +344,8 @@ def test_gguf_flashinfer_prefill_decode(checkpoint, config, monkeypatch):
     monkeypatch.setattr("minisgl.core._GLOBAL_CTX", ctx)
     ctx.attn_backend = FlashInferBackend(config)
     set_rope_device(device)
-    with torch.device(device), torch_dtype(torch.bfloat16):
-        attn = RopeAttn(config, 0, has_qk_norm=True)
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        attn = Qwen3DecoderLayer(config, 0).self_attn
     prefix = "model.layers.0.self_attn."
     attn.load_state_dict(
         {k.removeprefix(prefix): v for k, v in state.items() if k.startswith(prefix)}
@@ -352,9 +368,9 @@ def test_gguf_flashinfer_prefill_decode(checkpoint, config, monkeypatch):
         ctx.attn_backend.prepare_metadata(ctx.batch)
         x = torch.randn(length, 256, device=device, dtype=torch.bfloat16)
         q, k, v = [
-            F.linear(x, reference(tensors, f"blk.0.attn_{p}.weight", device)).view(
-                length, heads, 64
-            )
+            F.linear(
+                x, quantized_reference(reference(tensors, f"blk.0.attn_{p}.weight", device))
+            ).view(length, heads, 64)
             for p, heads in (("q", 4), ("k", 2), ("v", 2))
         ]
 
@@ -392,7 +408,9 @@ def test_gguf_flashinfer_prefill_decode(checkpoint, config, monkeypatch):
             .reshape(length, -1)
             .to(torch.bfloat16)
         )
-        ref = F.linear(ref, reference(tensors, "blk.0.attn_output.weight", device))
+        ref = F.linear(
+            ref, quantized_reference(reference(tensors, "blk.0.attn_output.weight", device))
+        )
         actual = attn.forward(x)
         torch.testing.assert_close(actual, ref, atol=0.008, rtol=0.03)
         cached += length

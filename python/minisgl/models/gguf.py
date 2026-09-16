@@ -1,4 +1,4 @@
-"""Qwen3 MoE GGUF weights: CPU experts stay packed; GPU weights become dense tensors."""
+"""Qwen3 MoE GGUF: packed CPU experts and Marlin GPU projection weights."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Iterator
 import gguf
 import numpy as np
 import torch
+from minisgl.layers.marlin import pack_marlin
 from tqdm import tqdm
 
 from .config import ModelConfig
@@ -18,8 +19,8 @@ def _gpu_tensor_specs(config: ModelConfig) -> Iterator[tuple[str, str, tuple[int
     hidden = config.hidden_size
     yield "token_embd.weight", "model.embed_tokens.weight", (config.vocab_size, hidden)
     yield "output_norm.weight", "model.norm.weight", (hidden,)
-    if not config.tie_word_embeddings:
-        yield "output.weight", "lm_head.weight", (config.vocab_size, hidden)
+    head = "token_embd.weight" if config.tie_word_embeddings else "output.weight"
+    yield head, "lm_head.weight", (config.vocab_size, hidden)
     for layer in range(config.num_layers):
         src, dst = f"blk.{layer}", f"model.layers.{layer}"
         for proj, heads in (
@@ -155,15 +156,25 @@ class GGUFWeights:
     def weights(
         self, device: torch.device, dtype: torch.dtype, *, chunk_bytes: int = 16 * 1024 * 1024
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        """Yield only GPU tensors, including fused QKV in Q, K, V order."""
+        """Pack QKV/O/head on CPU, then transfer only INT4 weights and BF16 scales."""
         qkv = []
         specs = list(_gpu_tensor_specs(self.config))
         for source, target, _ in tqdm(specs, desc="Loading GGUF GPU weights"):
-            weight = self._dequantize(source, device, dtype, chunk_bytes)
-            if target.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight")):
+            is_qkv = target.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight"))
+            is_marlin = is_qkv or target.endswith((".o_proj.weight", "lm_head.weight"))
+            weight = self._dequantize(
+                source, torch.device("cpu") if is_marlin else device, dtype, chunk_bytes
+            )
+            if is_qkv:
                 qkv.append(weight)
-                if len(qkv) == 3:
-                    yield target.replace(".v_proj.weight", ".qkv_proj.weight"), torch.cat(qkv)
-                    qkv.clear()
+                if len(qkv) < 3:
+                    continue
+                target = target.replace(".v_proj.weight", ".qkv_proj.weight")
+                weight = torch.cat(qkv)
+                qkv.clear()
+            if is_marlin:
+                packed, scales = pack_marlin(weight)
+                yield target, packed.to(device)
+                yield target.removesuffix(".weight") + ".scales", scales.to(device)
             else:
                 yield target, weight

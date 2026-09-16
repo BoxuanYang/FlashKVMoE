@@ -34,6 +34,9 @@ class Engine:
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
+        from minisgl.layers.marlin import marlin_gemm
+
+        marlin_gemm()  # Compile the pinned archive kernel before loading experts or graph capture.
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -144,7 +147,7 @@ class Engine:
         return tp_cpu_group
 
     def _load_weight_state_dict(self, weights: GGUFWeights) -> Dict[str, torch.Tensor]:
-        logger.info_rank0("Loading GPU weights from GGUF as BF16")
+        logger.info_rank0("Loading GGUF: Marlin INT4 QKV/O/head; BF16 embedding, norms and router")
         return dict(weights.weights(self.device, self.dtype))
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
