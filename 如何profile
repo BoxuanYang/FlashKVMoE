@@ -1,0 +1,86 @@
+终端 1：启动 minisgl
+cd ~/FlashKVMoE
+
+export NSYS_SESSION=minisgl_single
+
+CUDA_VISIBLE_DEVICES=2 \
+LOG_LEVEL=INFO \
+LOG_PID=1 \
+nsys launch \
+  --session-new="$NSYS_SESSION" \
+  --trace=cuda,nvtx,osrt \
+  --cuda-graph-trace=node:nvtx-precapture \
+  --show-output=true \
+  python -u -m minisgl \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --model /data2/models/Qwen3-30B-A3B \
+    --dtype bfloat16 \
+    --tp-size 1 \
+    --moe-backend kt \
+    --kt-weight-path /data2/models/Qwen3-30B-A3B-GGUF \
+    --kt-cpuinfer 128 \
+    --kt-threadpool-count 2 \
+    --kt-method LLAMAFILE \
+    --attention-backend fi \
+    --cuda-graph-max-bs 1 \
+    --page-size 1 \
+    --num-pages 2048 \
+    --max-seq-len-override 2048 \
+    --max-prefill-length 2048 \
+    --max-running-requests 1
+等待出现：
+API server is ready to serve on 127.0.0.1:30000
+终端 2：预热
+curl -sS http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "/data2/models/Qwen3-30B-A3B",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "temperature": 0,
+    "max_tokens": 16,
+    "ignore_eos": true,
+    "stream": false
+  }' \
+  -o /tmp/minisgl_warmup.json
+开始采集
+cd ~/FlashKVMoE
+mkdir -p profiles
+
+export NSYS_SESSION=minisgl_single
+export NSYS_OUTPUT="$PWD/profiles/qwen3_single_$(date +%Y%m%d_%H%M%S)"
+
+nsys start \
+  --session="$NSYS_SESSION" \
+  --sample=none \
+  --cpuctxsw=none \
+  --output="$NSYS_OUTPUT"
+发送正式请求
+curl -sS http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "/data2/models/Qwen3-30B-A3B",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Explain why the sky is blue in detail."
+      }
+    ],
+    "temperature": 0,
+    "max_tokens": 128,
+    "ignore_eos": true,
+    "stream": false
+  }' \
+  -o "${NSYS_OUTPUT}_response.json"
+停止采集
+nsys stop --session="$NSYS_SESSION"
+检查报告：
+ls -lh "${NSYS_OUTPUT}"*
+结束服务：
+nsys shutdown \
+  --session="$NSYS_SESSION" \
+  --kill=2
+
+
+
+git add -f profiles/

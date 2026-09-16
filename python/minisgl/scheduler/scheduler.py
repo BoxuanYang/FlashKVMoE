@@ -139,7 +139,8 @@ class Scheduler(SchedulerIOMixin):
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
-                print("overlap loop")
+                # print("overlap loop")
+                # 执行
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:

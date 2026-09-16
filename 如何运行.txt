@@ -35,7 +35,7 @@ CUDA_VISIBLE_DEVICES=2 python -m minisgl \
   --kt-weight-path /data2/models/Qwen3-30B-A3B-GGUF \
   --kt-cpuinfer 128 --kt-threadpool-count 2 \
   --kt-method LLAMAFILE \
-  --attention-backend fi --cuda-graph-max-bs 0 \
+  --attention-backend fi --cuda-graph-max-bs 1 \
   --page-size 1 --num-pages 2048 \
   --max-seq-len-override 2048 \
   --max-prefill-length 2048 --max-running-requests 100
