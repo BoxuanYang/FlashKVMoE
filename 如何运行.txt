@@ -62,3 +62,44 @@ curl --fail-with-body http://127.0.0.1:30000/v1/chat/completions \
     "max_tokens": 256,
     "stream": false
   }'
+
+四、Qwen3-30B-A3B：同时发送 4 个请求，每个输入 4096 tokens
+
+先停止原服务，使用下面的参数重新启动。原来的 2048 上下文上限无法处理 4k 输入。
+这里每个请求再生成 256 tokens，因此序列上限至少为 4352；4 个请求共需容纳约
+17408 tokens 的 KV cache，下面预留 18432 页（page-size=1）。
+max-prefill-length=16384 允许一批处理最多 4×4096 个输入 tokens；是否实际合批由调度决定。
+
+CUDA_VISIBLE_DEVICES=2 python -m minisgl \
+  --host 0.0.0.0 --port 30000 \
+  --model /data2/models/Qwen3-30B-A3B \
+  --dtype bfloat16 --tp-size 1 \
+  --moe-backend kt \
+  --kt-weight-path /data2/models/Qwen3-30B-A3B-GGUF \
+  --kt-cpuinfer 128 --kt-threadpool-count 2 \
+  --kt-method LLAMAFILE \
+  --attention-backend fi --cuda-graph-max-bs 0 \
+  --page-size 1 --num-pages 18432 \
+  --max-seq-len-override 4352 \
+  --max-prefill-length 16384 --max-running-requests 4
+
+等待服务就绪，另开终端，在同一环境、仓库根目录运行：
+
+python send.py
+
+脚本使用本地同一份 tokenizer，校验每个完整输入（含聊天模板）恰好为 4096 tokens。
+四个上下文分别来自 LongBench 的 narrativeqa（小说）、qasper（论文）、gov_report
+（政府报告）、qmsum（会议记录），各取一篇足够长的原文并截断，不重复填充正文。
+首次自动下载官方 data.zip（约 114 MB），之后使用 Hugging Face 本地缓存；下载和分词
+不计入请求耗时。数据来源：https://huggingface.co/datasets/zai-org/LongBench
+脚本打印每篇上下文的来源 ID，以及四个完整输入两两之间的最长公共 token 前缀。
+每轮使用新的随机前缀，避免重复运行命中上轮正文缓存；聊天模板仍可能共享少量前缀。
+每个请求设置 ignore_eos=True，目标输出 256 tokens。输出首段文本延迟、总耗时、
+回复预览和整轮吞吐。耗时包含排队，输出 token
+数由返回文本重新分词估算，因为当前服务的 usage 返回 0。
+同时提交 4 个请求不保证它们属于同一 prefill batch，以服务端调度日志为准。
+
+如果服务地址或模型目录不同：
+python send.py --url http://127.0.0.1:30000 --model /data2/models/Qwen3-30B-A3B
+
+如果修改 --output-tokens，需要相应增加服务端的序列上限与 KV cache 容量。
