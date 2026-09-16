@@ -36,7 +36,9 @@ class Engine:
         torch.cuda.set_device(self.device)
         from minisgl.layers.marlin import marlin_gemm
 
-        marlin_gemm()  # Compile the pinned archive kernel before loading experts or graph capture.
+        logger.info_rank0("Loading Marlin CUDA kernel; first use requires compilation")
+        marlin_gemm()  # Compile before loading experts or graph capture.
+        logger.info_rank0("Marlin CUDA kernel ready")
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)

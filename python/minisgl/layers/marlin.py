@@ -37,6 +37,7 @@ def marlin_gemm():
         extra_include_paths=[str(source)],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
+        verbose=True,
     ).gemm
 
 

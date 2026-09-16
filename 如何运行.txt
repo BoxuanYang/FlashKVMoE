@@ -16,6 +16,15 @@ python -m pip install -e .
 首次启动会编译并缓存 Marlin CUDA 内核，需要 nvcc、C++ 编译器和 ninja。
 保留 third_party/ktransformers 子模块的完整源码，无需安装 archive 的旧 Python 运行时。
 
+可先单独编译，成功后再启动服务（与服务使用相同环境和 GPU）：
+
+CUDA_VISIBLE_DEVICES=2 python -u -c 'from minisgl.layers.marlin import marlin_gemm; marlin_gemm(); print("Marlin ready", flush=True)'
+
+编译会显示 Ninja 输出，但单个 nvcc 编译步骤仍可能长时间没有新输出。
+可另开终端执行下面的命令，查看编译进程的 CPU 活动；该阶段不是 GPU 推理：
+
+ps -eo pid,ppid,etime,pcpu,pmem,args | grep -E '[n]inja|[n]vcc|[c]icc|[p]txas'
+
 二、启动（关闭 CUDA graph，沿用原参数）
 
 CUDA_VISIBLE_DEVICES=2 python -m minisgl \
