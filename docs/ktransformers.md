@@ -1,21 +1,22 @@
-# Qwen3 MoE：Mini-SGLang + KTransformers
+# Qwen3 MoE / DeepSeek V3：Mini-SGLang + KTransformers
 
-支持 Qwen3-30B-A3B、Qwen3-235B-A22B，全部模型权重从同一份完整 GGUF 加载。
+支持 Qwen3-30B-A3B、Qwen3-235B-A22B 和标准 DeepSeek V3，全部模型权重从同一份完整 GGUF 加载。
 HF 目录或仓库只提供 config 和 tokenizer 等小文件，无需下载 safetensors。
 使用 KT standalone Python API，不依赖 SGLang 或 sglang-kt。
 
 | 部分 | 计算位置 | 权重来源 |
 | --- | --- | --- |
-| Attention Q/K/V/O、LM head | GPU | GGUF 在 CPU 转为 Marlin INT4，group size 64，GEMM 内融合解量化 |
-| Embedding、Q/K norm、decoder norm、最终 norm、router | GPU | GGUF，加载时反量化为 BF16 |
+| 普通 Attention 投影、dense/shared FFN、LM head | GPU | GGUF 在 CPU 转为 Marlin INT4，group size 64，GEMM 内融合解量化 |
+| Embedding、norm、Qwen3 router、V3 MLA 的 K-B/V-B | GPU | GGUF，加载时反量化为 BF16 |
+| V3 router 与 correction bias | GPU | GGUF，FP32 |
 | RoPE | GPU | HF config |
-| 所有层、所有 MoE 专家的 gate/up/down 投影与激活 | CPU | KT 加载 GGUF |
+| MoE routed experts 的 gate/up/down 投影与激活 | CPU | KT 加载 GGUF |
 
-这里的 CPU MoE 指专家计算；router 是 GPU 上的小矩阵。GGUF 加载器只反量化非专家张量，
-不会把专家权重反量化或复制到 GPU。模型初始化使用 meta tensor，加载前
+这里的 CPU MoE 指 routed experts；router 与 shared expert 留在 GPU。GGUF 加载器不反量化
+或复制 routed expert 权重到 GPU。Qwen3 模型初始化使用 meta tensor，加载前
 将整层 `mlp` 替换为 `KTransformersMoE`，其内部直接完成 GPU router/top-k 并调用 KT
 wrapper，不再经过 `MoEMLP.experts`。原 router 保留为 `mlp.gate`，权重键不变；
-GPU state dict 中没有专家参数。MiniSGL 从 GGUF 加载 GPU 权重，
+GPU state dict 中没有 routed expert 参数。MiniSGL 从 GGUF 加载 GPU 权重，
 KT 从同一路径获取 `blk.N.ffn_{gate,up,down}_exps.weight`，保持专家量化格式。
 两个读取器使用 mmap，不需要第二份权重文件。
 
@@ -34,7 +35,20 @@ GGUF 的 Q4_K 等布局不能直接交给 Marlin；此次重新量化会增加�
 CPU 测试覆盖 F32/F16/BF16、Q8_0、Q4_0、Q4_K、Q6_K GPU 张量；其他类型取决于
 `gguf` 库的反量化实现，不支持的类型会报告具体张量和量化类型。专家类型仍受 KT 限制。
 
-范围限定为单 GPU、BF16 激活、LLAMAFILE、全部专家在 CPU、无 deferred experts。
+DeepSeek V3 使用 `deepseek_v3.py`：前三层 dense FFN 在 GPU；后续 `DeepseekMoEWrapper`
+内部执行 FP32 sigmoid/noaux_tc 分组路由，使用 correction bias 选专家，并对原始 sigmoid
+权重归一化、乘 routed_scaling_factor。执行顺序为 KT `submit_forward` → GPU shared expert
+→ KT `sync_forward` → 两路输出相加，CPU routed experts 可以与 GPU shared expert 重叠执行。
+直接复用 KT 的提交/同步接口，无需复制 archive 的缓冲区管理代码。
+
+V3 的 `--attention-backend fi` 自动选择 FlashInfer FA2 MLA，prefill/decode 都缓存每 token
+512 维 latent KV 与 64 维 RoPE key。Attention 前后按 head 的 K-B/V-B 矩阵保留 BF16，
+标准 V3 共约 1.91 GiB；其余大线性层复用 Marlin INT4。支持旧 GGUF 合并 `attn_kv_b`
+和新 GGUF 拆分 `attn_k_b` / `attn_v_b` 布局，GGUF architecture 为 `deepseek2`。
+GPU 权重估算共 11.48 GiB，不包括 KV cache、激活、workspace 和 graph；4090 峰值显存与
+完整生成尚需实机验证。启动命令见仓库根目录 `如何运行.txt`。不包含 MTP 或 V3.2 稀疏注意力。
+
+范围限定为单 GPU、BF16 激活、LLAMAFILE、routed experts 全部在 CPU、无 deferred experts。
 Qwen3 的 `qwen3_moe.py` 直接使用 `MarlinLinear`。它只保留 INT4/group-64 的打包和
 MiniSGL BaseOP 适配；CUDA 源文件直接来自固定 KT 子模块的
 `archive/csrc/ktransformers_ext/cuda/gptq_marlin`，首次启动由 PyTorch JIT 编译并缓存。
@@ -157,7 +171,7 @@ hf download Qwen/Qwen3-235B-A22B-GGUF \
 在仓库根目录执行：
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 python -m pytest tests/models/test_marlin.py tests/models/test_gguf.py tests/moe -o addopts= -v
+CUDA_VISIBLE_DEVICES=2 python -m pytest tests/models/test_marlin.py tests/models/test_gguf.py tests/models/test_deepseek_v3.py tests/moe -o addopts= -v
 ```
 
 CPU 测试检查 GGUF 专家不进入 GPU state dict、两种模型的全部层结构、路由、stream
