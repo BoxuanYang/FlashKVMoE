@@ -62,7 +62,7 @@ class Engine:
         from minisgl.moe.ktransformers import load_ktransformers_experts
 
         load_ktransformers_experts(self.model, config, cuda_graph_bs)
-        logger.info_rank0("KT: routed experts on CPU; remaining layers on GPU")
+        logger.info_rank0("KT: all experts on CPU; attention, norms, RoPE and router on GPU")
         self.model.load_state_dict(self._load_weight_state_dict(gguf_weights))
         del gguf_weights
 
@@ -149,21 +149,18 @@ class Engine:
         return tp_cpu_group
 
     def _load_weight_state_dict(self, weights: GGUFWeights) -> Dict[str, torch.Tensor]:
-        logger.info_rank0("Loading GPU weights from GGUF with Marlin INT4 linear layers")
+        logger.info_rank0("Loading GGUF: Marlin INT4 QKV/O/head; BF16 embedding, norms and router")
         return dict(weights.weights(self.device, self.dtype))
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
-        model = config.model_config
-        cache_width = (
-            model.kv_lora_rank + model.qk_rope_head_dim
-            if model.is_mla
-            else 2
-            * model.head_dim
-            * div_even(model.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        )
         cache_per_page = (
-            cache_width * config.page_size * self.dtype.itemsize * config.model_config.num_layers
+            2  # key + value
+            * config.model_config.head_dim
+            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+            * config.page_size
+            * self.dtype.itemsize
+            * config.model_config.num_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:
@@ -231,11 +228,8 @@ def _adjust_config(config: EngineConfig):
 
     if config.moe_backend != "kt":
         raise ValueError("Only the KT MoE backend with GGUF weights is supported")
-    if config.model_config.architectures not in (
-        ["Qwen3MoeForCausalLM"],
-        ["DeepseekV3ForCausalLM"],
-    ):
-        raise ValueError("KT supports Qwen3 MoE and DeepSeek V3 only")
+    if config.model_config.architectures != ["Qwen3MoeForCausalLM"]:
+        raise ValueError("KT supports Qwen3 MoE only (30B-A3B / 235B-A22B)")
     if config.tp_info.size != 1:
         raise ValueError("KT requires --tp-size 1")
     if config.dtype != torch.bfloat16:
@@ -248,15 +242,6 @@ def _adjust_config(config: EngineConfig):
         raise ValueError("KT requires 0 < kt-threadpool-count <= kt-cpuinfer")
     if config.max_forward_len <= 0 or config.max_running_req <= 0:
         raise ValueError("KT requires positive prefill and request limits")
-
-    if config.model_config.is_mla:
-        model = config.model_config
-        if (model.kv_lora_rank, model.qk_rope_head_dim) != (512, 64) or model.q_lora_rank <= 0:
-            raise ValueError("DeepSeek V3 MLA requires kv_lora_rank=512, rope_dim=64 and Q LoRA")
-        if config.attention_backend == "auto":
-            override("attention_backend", "fi")
-        if config.attention_backend != "fi" or config.page_size != 1:
-            raise ValueError("DeepSeek V3 requires --attention-backend fi --page-size 1")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

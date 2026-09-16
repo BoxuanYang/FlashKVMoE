@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict
-
 from transformers import PretrainedConfig
 
 
@@ -34,24 +32,10 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
-    q_lora_rank: int = 0
-    kv_lora_rank: int = 0
-    qk_nope_head_dim: int = 0
-    qk_rope_head_dim: int = 0
-    v_head_dim: int = 0
-    first_k_dense_replace: int = 0
-    n_shared_experts: int = 0
-    n_group: int = 1
-    topk_group: int = 1
-    routed_scaling_factor: float = 1.0
-
-    @property
-    def is_mla(self) -> bool:
-        return self.model_type == "deepseek_v3"
 
     @property
     def is_moe(self) -> bool:
-        return self.num_experts > 0
+        return "moe" in self.model_type
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
@@ -63,9 +47,7 @@ class ModelConfig:
                     setattr(config, attr, getattr(top, attr))
 
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        head_dim = (
-            getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        )
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         model_type = getattr(config, "model_type", "llama")
         num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
@@ -73,26 +55,9 @@ class ModelConfig:
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
-        mla = model_type == "deepseek_v3"
-        if mla:
-            if (config.scoring_func, config.topk_method, config.moe_layer_freq) != (
-                "sigmoid",
-                "noaux_tc",
-                1,
-            ):
-                raise ValueError(
-                    "DeepSeek V3 requires sigmoid/noaux_tc routing and moe_layer_freq=1"
-                )
-            if getattr(config, "index_topk", None) is not None:
-                raise ValueError("DeepSeek sparse attention is not supported")
-            num_experts = config.n_routed_experts
-            head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None:
-            rope_scaling = dict(rope_scaling)
-            rope_scaling.setdefault("rope_type", rope_scaling.get("type", "default"))
         rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
 
         return cls(
@@ -107,8 +72,8 @@ class ModelConfig:
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,
             rotary_config=RotaryConfig(
-                head_dim=config.qk_rope_head_dim if mla else head_dim,
-                rotary_dim=config.qk_rope_head_dim if mla else head_dim,
+                head_dim=head_dim,
+                rotary_dim=head_dim,
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=rope_scaling,
@@ -119,23 +84,4 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
-            **(
-                {
-                    name: getattr(config, name)
-                    for name in (
-                        "q_lora_rank",
-                        "kv_lora_rank",
-                        "qk_nope_head_dim",
-                        "qk_rope_head_dim",
-                        "v_head_dim",
-                        "first_k_dense_replace",
-                        "n_shared_experts",
-                        "n_group",
-                        "topk_group",
-                        "routed_scaling_factor",
-                    )
-                }
-                if mla
-                else {}
-            ),
         )

@@ -1,7 +1,6 @@
 """Real GGUF -> CPU KT -> CUDA test. Requires Linux, CUDA and the pinned kt-kernel."""
 
 import sys
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -119,74 +118,6 @@ def test_real_gguf_prefill_decode(kt_experts):
                 assert torch.isfinite(actual).all()
                 relative_error = (actual.float() - expected).norm() / expected.norm()
                 assert relative_error.item() < 0.025
-
-
-def test_deepseek_shared_and_kt_routed_experts(kt_experts):
-    from minisgl.layers.marlin import pack_marlin
-    from minisgl.models.deepseek_v3 import DeepseekMoEWrapper
-
-    experts, references = kt_experts
-    config = replace(
-        ModelConfig.from_hf(
-            Qwen3MoeConfig(
-                architectures=["Qwen3MoeForCausalLM"],
-                hidden_size=256,
-                moe_intermediate_size=256,
-                num_experts=4,
-                num_experts_per_tok=2,
-            )
-        ),
-        model_type="deepseek_v3",
-        n_shared_experts=1,
-        n_group=2,
-        topk_group=1,
-        routed_scaling_factor=2.5,
-    )
-    with torch.device("meta"):
-        layer = DeepseekMoEWrapper(config)
-    layer._wrapper = experts[0]._wrapper
-    layer.gate.weight = experts[0].gate.weight.float()
-    layer.gate.e_score_correction_bias = torch.tensor([-0.1, 0.1, 0.2, 0.0], device="cuda")
-    shared_weights = [torch.randn(256, 256).bfloat16() * 0.02 for _ in range(3)]
-    gate_up, scales = pack_marlin(torch.cat(shared_weights[:2]))
-    down, down_scales = pack_marlin(shared_weights[2])
-    layer.shared_experts.load_state_dict(
-        {
-            "gate_up_proj.weight": gate_up.cuda(),
-            "gate_up_proj.scales": scales.cuda(),
-            "down_proj.weight": down.cuda(),
-            "down_proj.scales": down_scales.cuda(),
-        }
-    )
-    gate, up, down = references[0]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream), torch.inference_mode():
-        for tokens in (1, 17, 1):
-            x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16)
-            ids, weights = layer.gate.forward(x)
-            shared = layer.shared_experts.forward(x)
-            expected = shared.float()
-            for i in range(4):
-                output = (F.silu(x.float() @ gate[i].T) * (x.float() @ up[i].T)) @ down[i].T
-                expected += (weights * (ids == i)).sum(-1, keepdim=True) * output
-            actual = layer.forward(x)
-            stream.synchronize()
-            assert (actual.float() - expected).norm() / expected.norm() < 0.03
-        # CPU callbacks and the GPU shared expert must both execute on every replay.
-        x = torch.randn(1, 256, device="cuda", dtype=torch.bfloat16)
-        layer.forward(x)
-        stream.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            actual = layer.forward(x)
-        for _ in range(3):
-            x.normal_()
-            expected = layer.forward(x).clone()
-            actual.fill_(float("nan"))
-            graph.replay()
-            stream.synchronize()
-            torch.testing.assert_close(actual, expected)
 
 
 def test_real_gguf_graph_replay_after_prefill(kt_experts, monkeypatch):

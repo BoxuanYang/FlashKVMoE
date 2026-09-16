@@ -28,10 +28,6 @@ def create_trtllm_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register("fi")
 def create_fi_backend(config: ModelConfig):
-    if config.is_mla:
-        from .fi_mla import FlashInferMLABackend
-
-        return FlashInferMLABackend(config)
     from .fi import FlashInferBackend
 
     return FlashInferBackend(config)

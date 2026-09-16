@@ -1,4 +1,4 @@
-Qwen3-30B-A3B / DeepSeek V3：单卡 GPU + KT CPU MoE + FlashInfer
+Qwen3-30B-A3B：单卡 GPU + KT CPU MoE + FlashInfer
 
 将修改后的代码同步到服务器，在仓库根目录执行以下命令。
 沿用 docs/ktransformers.md 中的 minisgl-kt 环境（CUDA Toolkit 和编译器安装在 Conda 环境内）。
@@ -46,29 +46,7 @@ QKV/O 投影和 LM head 自动使用 Marlin INT4，不需要新增启动参数�
 加载时在 CPU 反量化并重新量化为 Marlin 格式，再传到 GPU，会引入额外量化误差。
 Embedding、norm、router、激活和 KV cache 仍为 BF16，因此保留 --dtype bfloat16。
 
-三、DeepSeek V3 启动（沿用上述环境，模型目录按实际位置修改）
-
-CUDA_VISIBLE_DEVICES=2 python -m minisgl \
-  --host 0.0.0.0 --port 30000 \
-  --model /data2/models/DeepSeek-V3 \
-  --dtype bfloat16 --tp-size 1 \
-  --moe-backend kt \
-  --kt-weight-path /data2/models/DeepSeek-V3-GGUF \
-  --kt-cpuinfer 128 --kt-threadpool-count 2 \
-  --kt-method LLAMAFILE \
-  --attention-backend fi --cuda-graph-max-bs 0 \
-  --page-size 1 --num-pages 2048 \
-  --max-seq-len-override 2048 \
-  --max-prefill-length 2048 --max-running-requests 100
-
-前三层 dense FFN、后续 shared expert 留在 GPU，使用 Marlin INT4。
-DeepseekMoEWrapper 先提交 KT routed experts，再计算 GPU shared expert，最后同步并相加。
-FlashInfer 自动使用 MLA，KV cache 保存压缩 latent 与 RoPE key。
-MLA 的 K-B/V-B 使用 BF16；router 与 correction bias 使用 FP32；其余普通投影使用 Marlin INT4。
-标准 V3 的 GPU 权重估算约 11.48 GiB，未计 KV cache、激活、workspace 和 CUDA graph。
-GGUF 必须包含全部分片；--model 仍只需 config/tokenizer。完整生成与峰值显存待 GPU 实机验证。
-
-四、发送测试请求（另开终端；V3 请将 model 改为 /data2/models/DeepSeek-V3）
+三、发送测试请求（另开终端）
 
 curl --fail-with-body http://127.0.0.1:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
