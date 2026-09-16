@@ -1,5 +1,9 @@
 
 
+仅从 --kt-weight-path 的完整 GGUF 加载全部权重，GPU 权重反量化为 BF16。
+--model 目录只需 config/tokenizer，无需 safetensors；分片 GGUF 请传全部分片所在目录。
+已有环境更新依赖：python -m pip install -e .
+
 开启cuda graph:
 CUDA_VISIBLE_DEVICES=2 python -m minisgl   \
 --host 0.0.0.0   --port 30000   \

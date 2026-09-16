@@ -421,9 +421,6 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
 
     global _GLOBAL_STATE
 
-    if run_shell:
-        assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
-
     host = config.server_host
     port = config.server_port
 

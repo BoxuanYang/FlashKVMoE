@@ -9,8 +9,8 @@ from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
-from minisgl.models import create_model, load_weight
-from minisgl.moe import create_moe_backend
+from minisgl.models import create_model
+from minisgl.models.gguf import GGUFWeights
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from .config import EngineConfig
@@ -52,12 +52,14 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        if config.moe_backend == "kt":
-            from minisgl.moe.ktransformers import load_ktransformers_experts
+        assert config.kt_weight_path is not None
+        gguf_weights = GGUFWeights(config.kt_weight_path, config.model_config)
+        from minisgl.moe.ktransformers import load_ktransformers_experts
 
-            load_ktransformers_experts(self.model, config, cuda_graph_bs)
-            logger.info_rank0("KT: all experts on CPU; attention, norms, RoPE and router on GPU")
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+        load_ktransformers_experts(self.model, config, cuda_graph_bs)
+        logger.info_rank0("KT: all experts on CPU; attention, norms, RoPE and router on GPU")
+        self.model.load_state_dict(self._load_weight_state_dict(gguf_weights))
+        del gguf_weights
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -84,9 +86,6 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
-        if config.model_config.is_moe and config.moe_backend != "kt":
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
-
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
@@ -144,19 +143,9 @@ class Engine:
             assert tp_cpu_group is not None
         return tp_cpu_group
 
-    def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
-        if config.use_dummy_weight:
-            return {
-                k: torch.randn_like(v, device=self.device)
-                for k, v in self.model.state_dict().items()
-            }
-        else:
-            return {
-                k: v.to(self.dtype)
-                for k, v in load_weight(
-                    config.model_path, self.device, skip_experts=config.moe_backend == "kt"
-                )
-            }
+    def _load_weight_state_dict(self, weights: GGUFWeights) -> Dict[str, torch.Tensor]:
+        logger.info_rank0("Loading GPU weights from GGUF as BF16")
+        return dict(weights.weights(self.device, self.dtype))
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
@@ -232,23 +221,22 @@ def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
-    if config.moe_backend == "kt":
-        if config.model_config.architectures != ["Qwen3MoeForCausalLM"]:
-            raise ValueError("KT supports Qwen3 MoE only (30B-A3B / 235B-A22B)")
-        if config.tp_info.size != 1:
-            raise ValueError("KT requires --tp-size 1")
-        if config.dtype != torch.bfloat16:
-            raise ValueError("KT LLAMAFILE requires --dtype bfloat16")
-        if config.use_dummy_weight or not config.kt_weight_path:
-            raise ValueError("KT requires real GGUF weights via --kt-weight-path")
-        if config.kt_method != "LLAMAFILE":
-            raise ValueError("KT supports --kt-method LLAMAFILE only")
-        if not 0 < config.kt_threadpool_count <= config.kt_cpuinfer:
-            raise ValueError("KT requires 0 < kt-threadpool-count <= kt-cpuinfer")
-        if config.max_forward_len <= 0 or config.max_running_req <= 0:
-            raise ValueError("KT requires positive prefill and request limits")
-    elif config.kt_weight_path:
-        raise ValueError("--kt-weight-path requires --moe-backend kt")
+    if config.moe_backend != "kt":
+        raise ValueError("Only the KT MoE backend with GGUF weights is supported")
+    if config.model_config.architectures != ["Qwen3MoeForCausalLM"]:
+        raise ValueError("KT supports Qwen3 MoE only (30B-A3B / 235B-A22B)")
+    if config.tp_info.size != 1:
+        raise ValueError("KT requires --tp-size 1")
+    if config.dtype != torch.bfloat16:
+        raise ValueError("KT LLAMAFILE requires --dtype bfloat16")
+    if not config.kt_weight_path:
+        raise ValueError("KT requires a complete GGUF checkpoint via --kt-weight-path")
+    if config.kt_method != "LLAMAFILE":
+        raise ValueError("KT supports --kt-method LLAMAFILE only")
+    if not 0 < config.kt_threadpool_count <= config.kt_cpuinfer:
+        raise ValueError("KT requires 0 < kt-threadpool-count <= kt-cpuinfer")
+    if config.max_forward_len <= 0 or config.max_running_req <= 0:
+        raise ValueError("KT requires positive prefill and request limits")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
@@ -258,7 +246,3 @@ def _adjust_config(config: EngineConfig):
     if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64]:
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
-
-    if config.model_config.is_moe and config.moe_backend == "auto":
-        override("moe_backend", "fused")
-        logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")

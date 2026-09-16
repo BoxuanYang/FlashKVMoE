@@ -1,20 +1,35 @@
 # Qwen3 MoE：Mini-SGLang + KTransformers
 
-支持 Qwen3-30B-A3B、Qwen3-235B-A22B 的原始 BF16 Hugging Face 权重配套 GGUF 专家权重。
+支持 Qwen3-30B-A3B、Qwen3-235B-A22B，全部模型权重从同一份完整 GGUF 加载。
+HF 目录或仓库只提供 config 和 tokenizer 等小文件，无需下载 safetensors。
 使用 KT standalone Python API，不依赖 SGLang 或 sglang-kt。
 
 | 部分 | 计算位置 | 权重来源 |
 | --- | --- | --- |
-| Attention、Q/K norm、两个 decoder norm、最终 norm、RoPE | GPU | HF safetensors / RoPE 配置 |
-| Embedding、LM head、router 与 top-k | GPU | HF safetensors |
+| Attention Q/K/V/O、Q/K norm、两个 decoder norm、最终 norm | GPU | GGUF，加载时反量化为 BF16 |
+| Embedding、LM head、router 与 top-k | GPU | GGUF，加载时反量化为 BF16 |
+| RoPE | GPU | HF config |
 | 所有层、所有 MoE 专家的 gate/up/down 投影与激活 | CPU | KT 加载 GGUF |
 
-这里的 CPU MoE 指专家计算；router 是 GPU 上的小矩阵。HF 中的 `.mlp.experts.` 张量在
-`get_tensor()` 之前被过滤，不会先加载到 GPU 再卸载。模型初始化使用 meta tensor，加载前
+这里的 CPU MoE 指专家计算；router 是 GPU 上的小矩阵。GGUF 加载器只反量化非专家张量，
+不会把专家权重反量化或复制到 GPU。模型初始化使用 meta tensor，加载前
 将整层 `mlp` 替换为 `KTransformersMoE`，其内部直接完成 GPU router/top-k 并调用 KT
 wrapper，不再经过 `MoEMLP.experts`。原 router 保留为 `mlp.gate`，权重键不变；
-GPU state dict 中没有专家参数。GGUF 可以包含完整模型，
-KT 仅获取 `blk.N.ffn_{gate,up,down}_exps.weight`；文件 mmap 不等于加载非专家参数用于 CPU 计算。
+GPU state dict 中没有专家参数。MiniSGL 从 GGUF 加载 GPU 权重，
+KT 从同一路径获取 `blk.N.ffn_{gate,up,down}_exps.weight`，保持专家量化格式。
+两个读取器使用 mmap，不需要第二份权重文件。
+
+模型权重仅接受完整 GGUF，`--kt-weight-path` 指定单文件或同一量化版本的全部分片目录；
+不递归查找。启动时检查模型架构、必需张量、形状、关键配置及分片完整性。
+`--model` 只提供 config 和 tokenizer，不从该路径加载模型权重。
+
+GPU 权重按行分块反量化，避免 embedding/LM head 的完整 FP32 临时副本；转换为 BF16 后
+Q/K/V 按顺序合并，继续使用现有 Q/K norm、RoPE、FlashInfer 和 BF16 KV cache。
+Qwen3 MoE 的 Q/K 权重无需 Llama 式排列还原，参见
+[llama.cpp 的 Qwen3 MoE 转换实现](https://github.com/ggml-org/llama.cpp/blob/master/conversion/qwen.py)。
+此方案节省下载量和磁盘空间，GPU 常驻权重仍是 BF16，量化误差不会因反量化而消失。
+CPU 测试覆盖 F32/F16/BF16、Q8_0、Q4_0、Q4_K、Q6_K GPU 张量；其他类型取决于
+`gguf` 库的反量化实现，不支持的类型会报告具体张量和量化类型。专家类型仍受 KT 限制。
 
 范围限定为单 GPU、BF16 激活、LLAMAFILE、全部专家在 CPU、无 deferred experts。
 KT 模式支持 decode CUDA graph，prefill 仍走 eager。其他模型/精度/TP 配置会报错。
@@ -101,19 +116,21 @@ KT 仍可能强制选择 `/usr/bin/gcc`。GCC 固定为 13，处于 CUDA 12.8 �
 ## 2. 权重
 
 已有的 `/data2/models/Qwen3-30B-A3B` 和 `/data2/models/Qwen3-30B-A3B-GGUF`
-可以直接使用。HF 目录应含 config、tokenizer 和原始 BF16 safetensors；GGUF 必须与 HF
+可以直接使用。HF 目录只需含 config 和 tokenizer；GGUF 必须与 HF
 目录是同一模型版本。不要把不同量化版本的 GGUF 混放在一个目录。
 
-没有权重时，可执行以下命令（235B 的完整 HF 权重需要大量磁盘空间）：
+没有权重时，可执行以下命令，只下载一份 GGUF 权重以及 HF 小文件：
 
 ```bash
 hf download Qwen/Qwen3-30B-A3B \
+  --include 'config.json' 'generation_config.json' 'tokenizer*' 'vocab.json' 'merges.txt' 'special_tokens_map.json' 'added_tokens.json' 'chat_template*' \
   --local-dir /data2/models/Qwen3-30B-A3B
 hf download Qwen/Qwen3-30B-A3B-GGUF \
   --include 'Qwen3-30B-A3B-Q4_K_M.gguf' \
   --local-dir /data2/models/Qwen3-30B-A3B-GGUF
 
 hf download Qwen/Qwen3-235B-A22B \
+  --include 'config.json' 'generation_config.json' 'tokenizer*' 'vocab.json' 'merges.txt' 'special_tokens_map.json' 'added_tokens.json' 'chat_template*' \
   --local-dir /data2/models/Qwen3-235B-A22B
 hf download Qwen/Qwen3-235B-A22B-GGUF \
   --include 'Q4_K_M/*.gguf' \
@@ -122,6 +139,8 @@ hf download Qwen/Qwen3-235B-A22B-GGUF \
 
 官方 235B GGUF 使用 `Q4_K_M/` 子目录。KT 不递归查找 GGUF，因此启动时指向这个子目录，
 并保留全部分片。如果你的 GGUF 直接放在上一级目录，修改 `--kt-weight-path` 即可。
+不要仅传入第一个分片文件；应传整个分片目录。也可以直接用 `--model Qwen/Qwen3-30B-A3B`
+或对应 235B HF 仓库 ID，程序只按需获取 config/tokenizer，不调用 HF 权重下载器。
 文件名与目录来自 [30B GGUF](https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/tree/main)
 和 [235B GGUF](https://huggingface.co/Qwen/Qwen3-235B-A22B-GGUF/tree/main)。
 
@@ -130,11 +149,15 @@ hf download Qwen/Qwen3-235B-A22B-GGUF \
 在仓库根目录执行：
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 python -m pytest tests/moe -o addopts= -v
+CUDA_VISIBLE_DEVICES=2 python -m pytest tests/models/test_gguf.py tests/moe -o addopts= -v
 ```
 
-CPU 测试检查读取前过滤专家、原 GPU 后端的专家合并、两种模型的全部层结构、路由、stream
-和配置约束。`test_ktransformers_cuda.py` 在 Linux CUDA 上创建两层小型 Q8_0 GGUF，运行
+CPU 测试检查 GGUF 专家不进入 GPU state dict、两种模型的全部层结构、路由、stream
+和配置约束。`test_gguf.py` 写入真实混合量化 GGUF，验证完整非专家 state dict、
+QKV 数值和顺序、分片、缺失/重复张量、配置不匹配、绑定 embedding，以及不下载 HF 权重。
+其 CUDA 测试运行真实 QKV/norm/RoPE/FlashInfer/O 投影，比较 PyTorch SDPA 参考，覆盖
+prefill、连续 decode、有 KV cache 的 extend prefill 与随后 decode。
+`test_ktransformers_cuda.py` 在 Linux CUDA 上创建两层小型 Q8_0 GGUF，运行
 真实 KT LLAMAFILE，比较 PyTorch 反量化参考计算，并测试非默认 stream 和 decode/prefill/
 decode 的 batch 大小切换。GraphRunner 测试还覆盖多种捕获大小、padding、改变输入后的
 重复 replay，以及 eager prefill 后的 graph replay，与 eager 输出比较。
@@ -242,7 +265,7 @@ curl --fail-with-body http://127.0.0.1:30000/v1/chat/completions \
 成功请求才完成整模型 smoke test；测试跳过不算验收通过。
 
 实现入口：`python/minisgl/moe/ktransformers.py`，权重过滤在
-`python/minisgl/models/weight.py`，接线与约束在 `python/minisgl/engine/engine.py`。
+`python/minisgl/models/gguf.py`，接线与约束在 `python/minisgl/engine/engine.py`。
 上游接口参考：[KT Direct Python API](https://github.com/kvcache-ai/ktransformers/blob/4882505c9a66a6784b3360a1b6ba9b23d53d0291/kt-kernel/README.md#direct-python-api-usage)。
 固定提交的源码用 `gpu_experts_mask=None` 表示所有专家在 CPU；README 中的
 `num_gpu_experts` 示例与该源码签名有差异，本实现按源码调用。

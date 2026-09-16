@@ -63,7 +63,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     """
     from minisgl.attention import validate_attn_backend
     from minisgl.kvcache import SUPPORTED_CACHE_MANAGER
-    from minisgl.moe import SUPPORTED_MOE_BACKENDS
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
 
@@ -72,7 +71,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--model",
         type=str,
         required=True,
-        help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+        help="Local model folder or Hugging Face repo ID. With GGUF weights, only config and tokenizer files are used here.",
     )
 
     parser.add_argument(
@@ -111,14 +110,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=float,
         default=ServerArgs.memory_ratio,
         help="The fraction of GPU memory to use for KV cache.",
-    )
-
-    assert ServerArgs.use_dummy_weight == False
-    parser.add_argument(
-        "--dummy-weight",
-        action="store_true",
-        dest="use_dummy_weight",
-        help="Use dummy weights for testing.",
     )
 
     assert ServerArgs.use_pynccl == True
@@ -213,11 +204,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
-        choices=["auto", "kt"] + SUPPORTED_MOE_BACKENDS.supported_names(),
-        help="The MoE backend to use.",
+        choices=["kt"],
+        help="KT CPU experts; all model weights must come from GGUF.",
     )
-
-    parser.add_argument("--kt-weight-path", help="CPU expert GGUF file or directory (KT only).")
+    parser.add_argument(
+        "--kt-weight-path",
+        help="Complete GGUF file or directory used for all model weights. "
+        "For split GGUF, pass the directory containing all shards of one quantization.",
+    )
     parser.add_argument("--kt-cpuinfer", type=int, default=ServerArgs.kt_cpuinfer)
     parser.add_argument("--kt-threadpool-count", type=int, default=ServerArgs.kt_threadpool_count)
     parser.add_argument("--kt-method", choices=["LLAMAFILE"], default=ServerArgs.kt_method)
@@ -240,16 +234,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+    if kwargs["kt_weight_path"]:
+        kwargs["kt_weight_path"] = os.path.expanduser(kwargs["kt_weight_path"])
 
     if kwargs["model_source"] == "modelscope":
         model_path = kwargs["model_path"]
         if not os.path.isdir(model_path):
             from modelscope import snapshot_download
 
-            ignore_patterns = []
-            if kwargs["use_dummy_weight"]:
-                ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
-            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
+            model_path = snapshot_download(
+                model_path,
+                ignore_patterns=["*.bin", "*.safetensors", "*.pt", "*.ckpt", "*.gguf"],
+            )
             kwargs["model_path"] = model_path
     del kwargs["model_source"]
 

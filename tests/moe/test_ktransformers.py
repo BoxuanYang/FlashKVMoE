@@ -14,10 +14,8 @@ from minisgl.engine.engine import _adjust_config
 from minisgl.engine.graph import GraphRunner, _determine_cuda_graph_bs
 from minisgl.layers import LinearReplicated
 from minisgl.models import ModelConfig, create_model
-from minisgl.models import weight as weight_module
 from minisgl.moe.ktransformers import KTransformersMoE, load_ktransformers_experts
 from minisgl.server.args import parse_args
-from safetensors.torch import save_file
 from transformers import Qwen3MoeConfig
 
 
@@ -59,61 +57,6 @@ def wrapper_factory(monkeypatch, single_rank):
     factory = MagicMock(side_effect=lambda **kwargs: MagicMock())
     monkeypatch.setitem(sys.modules, "kt_kernel", SimpleNamespace(KTMoEWrapper=factory))
     return factory
-
-
-@pytest.mark.parametrize("skip_experts", [False, True])
-def test_filter_experts_before_read(tmp_path, monkeypatch, single_rank, skip_experts):
-    config = make_config().model_config
-    monkeypatch.setattr(ModelConfig, "from_hf", lambda _: config)
-    monkeypatch.setattr(weight_module, "cached_load_hf_config", lambda _: None)
-    tensors = {"model.layers.0.mlp.gate.weight": torch.randn(4, 256)}
-    for expert in range(4):
-        for proj in ("gate", "up", "down"):
-            tensors[f"model.layers.0.mlp.experts.{expert}.{proj}_proj.weight"] = torch.randn(
-                256, 256
-            )
-    save_file(tensors, str(tmp_path / "model.safetensors"))
-    real_open = weight_module.safetensors.safe_open
-    reads = []
-
-    class CheckedReader:
-        def __init__(self, *args, **kwargs):
-            self.reader = real_open(*args, **kwargs)
-
-        def __enter__(self):
-            self.reader.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self.reader.__exit__(*args)
-
-        def keys(self):
-            return self.reader.keys()
-
-        def get_tensor(self, name):
-            reads.append(name)
-            if skip_experts:
-                assert ".experts." not in name
-            return self.reader.get_tensor(name)
-
-    monkeypatch.setattr(weight_module.safetensors, "safe_open", CheckedReader)
-    loaded = dict(
-        weight_module.load_weight(str(tmp_path), torch.device("cpu"), skip_experts=skip_experts)
-    )
-    torch.testing.assert_close(
-        loaded["model.layers.0.mlp.gate.weight"], tensors["model.layers.0.mlp.gate.weight"]
-    )
-    assert len(reads) == (1 if skip_experts else 13)
-    if not skip_experts:
-        packed = loaded["model.layers.0.mlp.experts.gate_up_proj"]
-        for expert in range(4):
-            prefix = f"model.layers.0.mlp.experts.{expert}"
-            torch.testing.assert_close(
-                packed[expert],
-                torch.cat(
-                    [tensors[f"{prefix}.gate_proj.weight"], tensors[f"{prefix}.up_proj.weight"]]
-                ),
-            )
 
 
 @pytest.mark.parametrize(
@@ -290,7 +233,6 @@ def test_kt_graph_rejects_synchronous_submit(wrapper_factory, monkeypatch):
         {"tp_info": DistributedInfo(0, 2)},
         {"dtype": torch.float16},
         {"kt_weight_path": None},
-        {"use_dummy_weight": True},
         {"kt_method": "BF16"},
         {"kt_cpuinfer": 0},
         {"kt_threadpool_count": 0},

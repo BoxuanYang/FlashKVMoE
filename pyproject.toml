@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "accelerate",
+    "gguf>=0.17.0",
     "msgpack",
     "modelscope",
     "torch<2.10.0",

@@ -19,7 +19,7 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 256
     attention_backend: str = "auto"
-    moe_backend: str = "auto"
+    moe_backend: str = "kt"
     kt_weight_path: str | None = None
     kt_cpuinfer: int = 128
     kt_threadpool_count: int = 2
@@ -29,7 +29,6 @@ class EngineConfig:
     page_size: int = 1
     memory_ratio: float = 0.9
     distributed_timeout: float = 60.0
-    use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
