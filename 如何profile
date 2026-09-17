@@ -1,7 +1,7 @@
 终端 1：启动 minisgl
 cd ~/FlashKVMoE
 
-export NSYS_SESSION=minisgl_single
+export NSYS_SESSION=minisgl_four
 
 CUDA_VISIBLE_DEVICES=2 \
 LOG_LEVEL=INFO \
@@ -23,12 +23,12 @@ nsys launch \
     --kt-threadpool-count 2 \
     --kt-method LLAMAFILE \
     --attention-backend fi \
-    --cuda-graph-max-bs 1 \
-    --page-size 1 \
-    --num-pages 2048 \
-    --max-seq-len-override 2048 \
-    --max-prefill-length 2048 \
-    --max-running-requests 1
+    --cuda-graph-max-bs 5 \
+    --page-size 2 \
+    --num-pages 20000 \
+    --max-seq-len-override 7000 \
+    --max-prefill-length 7000 \
+    --max-running-requests 5
 等待出现：
 API server is ready to serve on 127.0.0.1:30000
 终端 2：预热
@@ -47,7 +47,7 @@ curl -sS http://127.0.0.1:30000/v1/chat/completions \
 cd ~/FlashKVMoE
 mkdir -p profiles
 
-export NSYS_SESSION=minisgl_single
+export NSYS_SESSION=minisgl_four
 export NSYS_OUTPUT="$PWD/profiles/qwen3_single_$(date +%Y%m%d_%H%M%S)"
 
 nsys start \
