@@ -222,7 +222,7 @@ def test_engine_loads_gguf_weights(checkpoint, config):
     assert "model.layers.0.self_attn.qkv_proj.weight" in state
 
 
-def test_shards_and_missing_shard(tmp_path, config):
+def test_shards_and_missing_shard(tmp_path, config, monkeypatch):
     tensors = checkpoint_tensors(config)
     entries = list(tensors.items())
     for index in range(2):
@@ -231,6 +231,13 @@ def test_shards_and_missing_shard(tmp_path, config):
     assert len(state) == 22
     with pytest.raises(ValueError, match="Incomplete GGUF shards"):
         GGUFWeights(str(tmp_path / "part-0.gguf"), config)
+
+    # llama.cpp stores model metadata only in the first shard.
+    readers = [gguf.GGUFReader(str(tmp_path / f"part-{i}.gguf")) for i in range(2)]
+    readers[1].fields.pop("general.architecture")
+    reader_iter = iter(readers)
+    monkeypatch.setattr(gguf, "GGUFReader", lambda *args, **kwargs: next(reader_iter))
+    GGUFWeights(str(tmp_path), config)
 
 
 @pytest.mark.parametrize(

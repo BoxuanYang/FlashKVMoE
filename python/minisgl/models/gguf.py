@@ -68,13 +68,15 @@ class GGUFWeights:
         self.tensors = {}
         self.config = config
         shard_ids = []
-        for reader in self.readers:
+        for index, reader in enumerate(self.readers):
             if reader.endianess != gguf.GGUFEndian.LITTLE:
                 raise ValueError("Only little-endian GGUF checkpoints are supported")
             fields = reader.fields
             architecture = fields.get("general.architecture")
-            if architecture is None or architecture.contents() != "qwen3moe":
-                raise ValueError("Expected general.architecture=qwen3moe in every GGUF shard")
+            if (index == 0 and architecture is None) or (
+                architecture is not None and architecture.contents() != "qwen3moe"
+            ):
+                raise ValueError("Expected general.architecture=qwen3moe in the first GGUF shard")
             count = fields.get("split.count")
             if count is not None:
                 if count.contents() != len(files) or "split.no" not in fields:
