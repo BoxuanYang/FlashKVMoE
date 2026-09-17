@@ -2,6 +2,7 @@
 
 import ast
 import math
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -249,11 +250,52 @@ def write_v3(path, c, split=False):
 
 
 @pytest.mark.parametrize("split", [False, True])
-def test_gguf_and_model_state(config, tmp_path, monkeypatch, split):
+@pytest.mark.parametrize(
+    "byte_split",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="Byte-split mmap needs Linux"),
+        ),
+    ],
+)
+def test_gguf_and_model_state(config, tmp_path, monkeypatch, split, byte_split):
     path = tmp_path / "v3.gguf"
     tensors = write_v3(path, config, split)
-    factory = MagicMock(side_effect=lambda **kwargs: MagicMock())
+    if byte_split:
+        content = path.read_bytes()
+        path = tmp_path / "parts"
+        path.mkdir()
+        part_size = 1024 * 1024
+        count = (len(content) + part_size - 1) // part_size
+        for i in range(count):
+            (path / f"v3.gguf.part{i + 1}of{count}").write_bytes(
+                content[i * part_size : (i + 1) * part_size]
+            )
+    loader = GGUFWeights(str(path), config)
+    cache = {}
+
+    def create_wrapper(**kwargs):
+        # Exercise the interface used by pinned KT without requiring its C++ kernel.
+        assert cache[os.path.realpath(kwargs["weight_path"])] is loader
+        for proj in ("gate", "up", "down"):
+            name = f"blk.{kwargs['layer_idx']}.ffn_{proj}_exps.weight"
+            packed, quant = cache[
+                os.path.realpath(kwargs["weight_path"])
+            ].get_undequanted_tensor_and_ggml_type(name)
+            assert quant == gguf.GGMLQuantizationType.F32
+            assert packed.data_ptr() == loader.tensors[name].data.ctypes.data
+            np.testing.assert_array_equal(packed.numpy(), tensors[name].view(np.uint8).reshape(-1))
+        return MagicMock()
+
+    factory = MagicMock(side_effect=create_wrapper)
     monkeypatch.setitem(sys.modules, "kt_kernel", SimpleNamespace(KTMoEWrapper=factory))
+    monkeypatch.setitem(
+        sys.modules,
+        "kt_kernel.utils.llamafile",
+        SimpleNamespace(LlamafileMoEWrapper=SimpleNamespace(_gguf_loaders_by_path=cache)),
+    )
     monkeypatch.setitem(sys.modules, "flashinfer", MagicMock())
     monkeypatch.setattr("minisgl.models.deepseek_v3.get_rope", lambda *args: None)
     with torch.device("meta"), torch_dtype(torch.bfloat16):
@@ -261,11 +303,10 @@ def test_gguf_and_model_state(config, tmp_path, monkeypatch, split):
     engine = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16, kt_weight_path=str(path))
     engine.__dict__["model_config"] = config
     _adjust_config(engine)
-    load_ktransformers_experts(model, engine)
+    load_ktransformers_experts(model, engine, gguf_weights=loader)
     assert isinstance(model.model.layers.op_list[0].mlp, DeepseekMLP)
     assert isinstance(model.model.layers.op_list[1].mlp, DeepseekMoEWrapper)
     assert factory.call_count == 1 and factory.call_args.kwargs["layer_idx"] == 1
-    loader = GGUFWeights(str(path), config)
     dequantize = loader._dequantize
 
     def checked(name, *args):

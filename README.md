@@ -10,6 +10,8 @@ The CUDA kernel is compiled directly from the pinned KT archive at first startup
 
 The `--model` path or Hugging Face model ID supplies only the config and tokenizer. It does not supply model weights. `--kt-weight-path` must point to a **complete GGUF file** or a directory containing **every shard of one GGUF quantization**. A GGUF containing only experts is insufficient.
 
+Linux also supports byte-split files such as `DeepSeek-V3.IQ4_XS.gguf.part1of8` through `part8of8`: pass their directory or any one part. All parts must be present; every part except the last must have a size divisible by the OS page size. The loader maps them into contiguous virtual addresses and shares the packed tensor views with KT, including tensors crossing file boundaries. No merged file or full in-memory concatenation is created. Do not mix multiple quantizations or a merged `.gguf` with its parts in the same input directory.
+
 ## Quick start: Qwen3-30B-A3B
 
 Follow the [installation instructions](docs/ktransformers.md#1-克隆与安装) to install this repository and build the pinned KT kernel. Download a single GGUF checkpoint:

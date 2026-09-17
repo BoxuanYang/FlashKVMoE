@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Iterator
 
 import gguf
@@ -12,6 +11,7 @@ from minisgl.layers.marlin import pack_marlin
 from tqdm import tqdm
 
 from .config import ModelConfig
+from .gguf_parts import open_gguf_readers
 
 
 def _gpu_tensor_specs(config: ModelConfig) -> Iterator[tuple[str, str, tuple[int, ...]]]:
@@ -103,12 +103,8 @@ class GGUFWeights:
         if config.architectures not in (["Qwen3MoeForCausalLM"], ["DeepseekV3ForCausalLM"]):
             raise ValueError("GGUF GPU weight loading supports Qwen3 MoE and DeepSeek V3 only")
         architecture_name = "deepseek2" if config.is_mla else "qwen3moe"
-        source = Path(path)
-        files = sorted(source.glob("*.gguf")) if source.is_dir() else [source]
-        if not files or any(not f.is_file() or f.suffix != ".gguf" for f in files):
-            raise FileNotFoundError(f"No GGUF checkpoint found at {path}")
         # Readers mmap the packed data. Keep them alive until weight iteration completes.
-        self.readers = [gguf.GGUFReader(str(file), mode="r") for file in files]
+        self.readers = open_gguf_readers(path)
         self.tensors = {}
         self.config = config
         shard_ids = []
@@ -123,7 +119,7 @@ class GGUFWeights:
                 )
             count = fields.get("split.count")
             if count is not None:
-                if count.contents() != len(files) or "split.no" not in fields:
+                if count.contents() != len(self.readers) or "split.no" not in fields:
                     raise ValueError("Incomplete GGUF shards: pass a directory with all shards")
                 shard_ids.append(fields["split.no"].contents())
             for tensor in reader.tensors:
@@ -132,9 +128,9 @@ class GGUFWeights:
                         f"Duplicate GGUF tensor {tensor.name}; use one quantization only"
                     )
                 self.tensors[tensor.name] = tensor
-        if shard_ids and sorted(shard_ids) != list(range(len(files))):
+        if shard_ids and sorted(shard_ids) != list(range(len(self.readers))):
             raise ValueError("Inconsistent GGUF split metadata or duplicate shard indices")
-        if len(files) > 1 and not shard_ids:
+        if len(self.readers) > 1 and not shard_ids:
             raise ValueError("Multiple GGUF files without split metadata; select one checkpoint")
 
         expected = {name: shape for name, _, shape in _gpu_tensor_specs(config)}
@@ -204,6 +200,11 @@ class GGUFWeights:
                     raise ValueError(
                         f"GGUF metadata {architecture_name}.{key} does not match --model config"
                     )
+
+    def get_undequanted_tensor_and_ggml_type(self, name: str):
+        """KT's loader protocol: a packed byte view, never a dequantized expert copy."""
+        tensor = self.tensors[name]
+        return torch.from_numpy(tensor.data.view(np.uint8).reshape(-1)), tensor.tensor_type
 
     def _dequantize(
         self, name: str, device: torch.device, dtype: torch.dtype, chunk_bytes: int

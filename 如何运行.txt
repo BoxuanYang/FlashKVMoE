@@ -68,6 +68,14 @@ MLA 的 K-B/V-B 使用 BF16；router 与 correction bias 使用 FP32；其余普
 标准 V3 的 GPU 权重估算约 11.48 GiB，未计 KV cache、激活、workspace 和 CUDA graph。
 GGUF 必须包含全部分片；--model 仍只需 config/tokenizer。完整生成与峰值显存待 GPU 实机验证。
 
+对于 DeepSeek-V3.IQ4_XS.gguf.part1of8 ... part8of8 这种按字节切开的文件，
+直接将 --kt-weight-path 指向八个文件所在目录即可，无需 cat 合并，也无需修改文件名。
+Linux 加载器按编号将各文件映射到连续虚拟地址，GPU 加载与 KT 共用同一份映射；
+不会创建额外的大文件或在内存中拼接整份权重。除最后一片外，切片大小必须是系统页大小
+的整数倍（上述发布版本的切片满足此条件）。目录中只放一套完整权重切片。
+如果 config.json、tokenizer.json、tokenizer_config.json 也在该目录，--model 同样使用
+/data2/models/DeepSeek-V3-GGUF。此改动不降低 KT 运行所需的 CPU 权重内存。
+
 四、发送测试请求（另开终端；V3 请将 model 改为 /data2/models/DeepSeek-V3）
 
 curl --fail-with-body http://127.0.0.1:30000/v1/chat/completions \

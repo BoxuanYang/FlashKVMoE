@@ -9,10 +9,15 @@ from minisgl.layers import BaseOP, LinearReplicated
 if TYPE_CHECKING:
     from minisgl.engine import EngineConfig
     from minisgl.models import BaseLLMModel
+    from minisgl.models.gguf import GGUFWeights
 
 
 def load_ktransformers_experts(
-    model: BaseLLMModel, config: EngineConfig, cuda_graph_bs: list[int] | None = None
+    model: BaseLLMModel,
+    config: EngineConfig,
+    cuda_graph_bs: list[int] | None = None,
+    *,
+    gguf_weights: GGUFWeights | None = None,
 ) -> None:
     from kt_kernel import KTMoEWrapper
 
@@ -26,6 +31,14 @@ def load_ktransformers_experts(
     # captured D2H, CPU callbacks and H2D keep valid addresses during replay,
     # even after an eager prefill uses a different batch size.
     KTMoEWrapper.set_capture_batch_sizes(cuda_graph_bs)
+    if gguf_weights is not None:
+        from kt_kernel.utils.llamafile import LlamafileMoEWrapper
+
+        # Reuse our validated mapping through the pinned KT loader cache. In particular,
+        # KT must not rescan .partNofM files as if each were an independent GGUF.
+        LlamafileMoEWrapper._gguf_loaders_by_path[os.path.realpath(config.kt_weight_path)] = (
+            gguf_weights
+        )
     max_graph_bs = max(cuda_graph_bs, default=0)
     # Replace the entire MLP BEFORE loading GPU weights, retaining its router
     # under mlp.gate so the Hugging Face checkpoint keys remain unchanged.

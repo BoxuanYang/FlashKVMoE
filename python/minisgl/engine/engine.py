@@ -61,7 +61,7 @@ class Engine:
         gguf_weights = GGUFWeights(config.kt_weight_path, config.model_config)
         from minisgl.moe.ktransformers import load_ktransformers_experts
 
-        load_ktransformers_experts(self.model, config, cuda_graph_bs)
+        load_ktransformers_experts(self.model, config, cuda_graph_bs, gguf_weights=gguf_weights)
         logger.info_rank0("KT: routed experts on CPU; remaining layers on GPU")
         self.model.load_state_dict(self._load_weight_state_dict(gguf_weights))
         del gguf_weights
