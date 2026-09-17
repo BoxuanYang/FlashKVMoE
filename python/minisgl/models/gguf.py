@@ -176,12 +176,20 @@ class GGUFWeights:
             "attention.layer_norm_rms_epsilon": config.rms_norm_eps,
         }
         if config.is_mla:
+            # Older DeepSeek GGUFs describe expanded heads; newer ones describe
+            # the compressed MLA cache. Both contain the same attention tensors.
+            kv_heads = self.readers[0].fields.get(f"{architecture_name}.attention.head_count_kv")
+            compressed_kv = kv_heads is not None and kv_heads.contents() == 1
             metadata.update(
                 {
-                    # GGUF describes the compressed MQA cache here, not HF's expanded heads.
-                    "attention.head_count_kv": 1,
-                    "attention.key_length": config.kv_lora_rank + config.qk_rope_head_dim,
-                    "attention.value_length": config.kv_lora_rank,
+                    "attention.head_count_kv": 1 if compressed_kv else config.num_kv_heads,
+                    "attention.key_length": (
+                        config.kv_lora_rank + config.qk_rope_head_dim
+                        if compressed_kv else config.head_dim
+                    ),
+                    "attention.value_length": (
+                        config.kv_lora_rank if compressed_kv else config.v_head_dim
+                    ),
                     "attention.key_length_mla": config.head_dim,
                     "attention.value_length_mla": config.v_head_dim,
                     "attention.q_lora_rank": config.q_lora_rank,
@@ -198,7 +206,8 @@ class GGUFWeights:
                     field.contents(), expected_value, rtol=1e-6, atol=0
                 ):
                     raise ValueError(
-                        f"GGUF metadata {architecture_name}.{key} does not match --model config"
+                        f"GGUF metadata {architecture_name}.{key}={field.contents()} "
+                        f"does not match --model config ({expected_value})"
                     )
 
     def get_undequanted_tensor_and_ggml_type(self, name: str):

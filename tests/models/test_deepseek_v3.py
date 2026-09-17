@@ -168,7 +168,7 @@ def test_shared_expert_runs_between_kt_submit_and_sync(config, monkeypatch):
     assert events == ["submit", "shared", "sync"]
 
 
-def write_v3(path, c, split=False):
+def write_v3(path, c, split=False, compressed_kv=True):
     """Independent HF-to-GGUF layout, including expert tensors never unpacked by MiniSGL."""
     rng = np.random.default_rng(17)
     tensors = {}
@@ -218,13 +218,14 @@ def write_v3(path, c, split=False):
             )
     writer = gguf.GGUFWriter(str(path), "deepseek2")
     writer.add_float32("deepseek2.rope.freq_base", c.rotary_config.base)
-    # llama.cpp's metadata describes a single compressed KV head, unlike HF config.
     for key, value in {
         "block_count": c.num_layers,
         "attention.head_count": c.num_qo_heads,
-        "attention.head_count_kv": 1,
-        "attention.key_length": c.kv_lora_rank + c.qk_rope_head_dim,
-        "attention.value_length": c.kv_lora_rank,
+        "attention.head_count_kv": 1 if compressed_kv else c.num_kv_heads,
+        "attention.key_length": (
+            c.kv_lora_rank + c.qk_rope_head_dim if compressed_kv else c.head_dim
+        ),
+        "attention.value_length": c.kv_lora_rank if compressed_kv else c.v_head_dim,
         "attention.key_length_mla": c.head_dim,
         "attention.value_length_mla": c.v_head_dim,
         "attention.q_lora_rank": c.q_lora_rank,
@@ -247,6 +248,12 @@ def write_v3(path, c, split=False):
     writer.write_tensors_to_file()
     writer.close()
     return tensors
+
+
+def test_legacy_v3_gguf_metadata(config, tmp_path):
+    path = tmp_path / "v3.gguf"
+    write_v3(path, config, compressed_kv=False)
+    GGUFWeights(str(path), config)
 
 
 @pytest.mark.parametrize("split", [False, True])
