@@ -1,94 +1,165 @@
-Qwen3-30B-A3B / DeepSeek V3：单卡 GPU + KT CPU MoE + FlashInfer
+MiniSGLang + KT：实验室新机器从零部署（V3-branch）
 
-将修改后的代码同步到服务器，在仓库根目录执行以下命令。
-沿用 docs/ktransformers.md 中的 minisgl-kt 环境（CUDA Toolkit 和编译器安装在 Conda 环境内）。
+适用范围：Linux x86_64、单张支持 BF16 的 NVIDIA GPU、AVX2 CPU；运行 Qwen3-30B-A3B
+或标准 DeepSeek V3。下面命令使用 Bash。机器须先有可用的 NVIDIA 驱动；驱动由机器管理员
+安装，Conda 中的 CUDA Toolkit 不能代替驱动。先执行 nvidia-smi，失败则先解决驱动问题。
+所有命令在同一终端执行；示例选择物理 GPU 0，按 nvidia-smi 显示的编号修改。
 
-一、准备环境
+nvidia-smi
 
+1. 安装 Miniforge（已有 Conda 可跳过下载和安装，但仍需激活 Conda shell）
+
+cd "$HOME"
+curl -fsSLo Miniforge3-Linux-x86_64.sh \
+  https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+bash Miniforge3-Linux-x86_64.sh -b -p "$HOME/miniforge3"
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+
+如已有 Conda，改为执行：source "$(conda info --base)/etc/profile.d/conda.sh"
+
+2. 克隆 V3 分支并安装编译环境
+
+conda create -n minisgl-kt --override-channels -c conda-forge -y \
+  python=3.12 pip git 'cmake<4' ninja make pkg-config libhwloc libnuma \
+  gcc_linux-64=13 gxx_linux-64=13
 conda activate minisgl-kt
+conda install --override-channels -c nvidia/label/cuda-12.8.1 -c conda-forge -y \
+  cuda-toolkit=12.8.1
+
+cd "$HOME"
+git clone --branch V3-branch https://github.com/BoxuanYang/FlashKVMoE.git
+cd FlashKVMoE
+git submodule update --init third_party/ktransformers
+git -C third_party/ktransformers submodule update --init --recursive \
+  third_party/llama.cpp third_party/pybind11
+git -C third_party/ktransformers rev-parse HEAD
+# 应显示仓库固定提交 4882505c9a66a6784b3360a1b6ba9b23d53d0291
+
+export CUDA_VISIBLE_DEVICES=0
 export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
 export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-cc"
 export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
 export CUDAHOSTCXX="$CXX"
+export CMAKE_PREFIX_PATH="$CONDA_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig:$CONDA_PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+nvcc --version
+"$CXX" --version
+pkg-config --modversion hwloc
+nvidia-smi
+
+3. 安装 MiniSGLang 和仓库固定的 KT 源码
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -e .
+python -m pip install pybind11 huggingface_hub pytest
+CMAKE_ARGS="-DUSE_CONDA_TOOLCHAIN=ON" \
+  CPUINFER_USE_CUDA=1 CPUINFER_CPU_INSTRUCT=NATIVE CPUINFER_PARALLEL=8 \
+  python -m pip install --no-build-isolation -v -e third_party/ktransformers/kt-kernel
+python -m pip check
 
-首次启动会编译并缓存 Marlin CUDA 内核，需要 nvcc、C++ 编译器和 ninja。
-保留 third_party/ktransformers 子模块的完整源码，无需安装 archive 的旧 Python 运行时。
+确认 CUDA 可用，并确认加载的是刚克隆的 KT，而非其他 Conda 环境中遗留的版本：
 
-可先单独编译，成功后再启动服务（与服务使用相同环境和 GPU）：
+python - <<'PY'
+from pathlib import Path
+import inspect
+import torch
+from kt_kernel import kt_kernel_ext
+from kt_kernel.utils.llamafile import LlamafileMoEWrapper
 
-CUDA_VISIBLE_DEVICES=2 python -u -c 'from minisgl.layers.marlin import marlin_gemm; marlin_gemm(); print("Marlin ready", flush=True)'
+source = Path(inspect.getfile(LlamafileMoEWrapper)).resolve()
+expected = (Path.cwd() / 'third_party/ktransformers/kt-kernel/python').resolve()
+assert source.is_relative_to(expected), f'KT 来自错误位置：{source}'
+assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+assert hasattr(kt_kernel_ext.CPUInfer, 'submit_with_cuda_stream')
+print('GPU:', torch.cuda.get_device_name(0))
+print('KT source:', source)
+PY
 
-编译会显示 Ninja 输出，但单个 nvcc 编译步骤仍可能长时间没有新输出。
-可另开终端执行下面的命令，查看编译进程的 CPU 活动；该阶段不是 GPU 推理：
+提前编译 Marlin，首次 nvcc 编译可能持续数分钟；以后会使用 PyTorch 缓存：
 
-ps -eo pid,ppid,etime,pcpu,pmem,args | grep -E '[n]inja|[n]vcc|[c]icc|[p]txas'
+python -u -c 'from minisgl.layers.marlin import marlin_gemm; marlin_gemm(); print("Marlin ready", flush=True)'
 
-二、启动（关闭 CUDA graph，沿用原参数）
+在下载大模型前，用小型测试验证真实 CUDA Marlin 和 KT 路径：
 
-CUDA_VISIBLE_DEVICES=2 python -m minisgl \
-  --host 0.0.0.0 --port 30000 \
+python -m pytest -o addopts= -q tests/models/test_marlin.py tests/moe/test_ktransformers_cuda.py
+
+4. 下载一份 GGUF 和对应的小型配置文件
+
+以下路径以 /data2/models 为例；若新机器没有可写的 /data2/models，把下列下载路径和
+启动命令中的路径一起改成实际路径。只下载 GGUF 权重，不下载 safetensors。
+若权重已从旧机器复制过来，可跳过对应的 GGUF 下载，但要确保文件完整且属于同一量化版本。
+
+先以 Qwen3-30B-A3B 做启动验证：
+
+mkdir -p /data2/models
+hf download Qwen/Qwen3-30B-A3B \
+  config.json tokenizer.json tokenizer_config.json \
+  --local-dir /data2/models/Qwen3-30B-A3B
+hf download Qwen/Qwen3-30B-A3B-GGUF \
+  Qwen3-30B-A3B-Q4_K_M.gguf \
+  --local-dir /data2/models/Qwen3-30B-A3B-GGUF
+
+若要运行 DeepSeek V3，再下载其配置/tokenizer 和一整套 IQ4_XS GGUF 字节分片。
+GGUF 约 360 GB；下载前确认磁盘容量，并准备足够的 CPU 内存供 KT 加载专家。
+八片必须全部位于同一目录，不能只下载第一片，也不需要 cat 合并。
+
+hf download deepseek-ai/DeepSeek-V3 \
+  config.json tokenizer.json tokenizer_config.json \
+  --local-dir /data2/models/DeepSeek-V3
+hf download mradermacher/DeepSeek-V3-GGUF \
+  --include 'DeepSeek-V3.IQ4_XS.gguf.part*of8' \
+  --local-dir /data2/models/DeepSeek-V3-GGUF
+
+5. 启动服务（只选一个模型；新终端需重新激活 Conda 并执行第 2 步的 export 段）
+
+Qwen3-30B-A3B 首次验证：
+
+python -u -m minisgl \
+  --host 127.0.0.1 --port 30000 \
   --model /data2/models/Qwen3-30B-A3B \
-  --dtype bfloat16 --tp-size 1 \
-  --moe-backend kt \
   --kt-weight-path /data2/models/Qwen3-30B-A3B-GGUF \
-  --kt-cpuinfer 128 --kt-threadpool-count 2 \
-  --kt-method LLAMAFILE \
-  --attention-backend fi --cuda-graph-max-bs 1 \
-  --page-size 1 --num-pages 2048 \
-  --max-seq-len-override 2048 \
-  --max-prefill-length 2048 --max-running-requests 100
-
-所有权重只从 --kt-weight-path 的完整 GGUF 加载；分片 GGUF 请传全部分片所在目录。
---model 目录只需 config/tokenizer，无需 safetensors。
-QKV/O 投影和 LM head 自动使用 Marlin INT4，不需要新增启动参数。
-加载时在 CPU 反量化并重新量化为 Marlin 格式，再传到 GPU，会引入额外量化误差。
-Embedding、norm、router、激活和 KV cache 仍为 BF16，因此保留 --dtype bfloat16。
-
-三、DeepSeek V3 启动（沿用上述环境，模型目录按实际位置修改）
-
-CUDA_VISIBLE_DEVICES=2 python -m minisgl \
-  --host 0.0.0.0 --port 30000 \
-  --model /data2/models/DeepSeek-V3 \
-  --dtype bfloat16 --tp-size 1 \
-  --moe-backend kt \
-  --kt-weight-path /data2/models/DeepSeek-V3-GGUF \
-  --kt-cpuinfer 128 --kt-threadpool-count 2 \
-  --kt-method LLAMAFILE \
+  --dtype bfloat16 --tp-size 1 --moe-backend kt \
+  --kt-cpuinfer 128 --kt-threadpool-count 2 --kt-method LLAMAFILE \
   --attention-backend fi --cuda-graph-max-bs 0 \
-  --page-size 1 --num-pages 2048 \
-  --max-seq-len-override 2048 \
-  --max-prefill-length 2048 --max-running-requests 100
+  --page-size 1 --num-pages 2048 --max-seq-len-override 2048 \
+  --max-prefill-length 2048 --max-running-requests 1
 
-前三层 dense FFN、后续 shared expert 留在 GPU，使用 Marlin INT4。
-DeepseekMoEWrapper 先提交 KT routed experts，再计算 GPU shared expert，最后同步并相加。
-FlashInfer 自动使用 MLA，KV cache 保存压缩 latent 与 RoPE key。
-MLA 的 K-B/V-B 使用 BF16；router 与 correction bias 使用 FP32；其余普通投影使用 Marlin INT4。
-标准 V3 的 GPU 权重估算约 11.48 GiB，未计 KV cache、激活、workspace 和 CUDA graph。
-GGUF 必须包含全部分片；--model 仍只需 config/tokenizer。完整生成与峰值显存待 GPU 实机验证。
+DeepSeek V3 首次验证：
 
-对于 DeepSeek-V3.IQ4_XS.gguf.part1of8 ... part8of8 这种按字节切开的文件，
-直接将 --kt-weight-path 指向八个文件所在目录即可，无需 cat 合并，也无需修改文件名。
-Linux 加载器按编号将各文件映射到连续虚拟地址，GPU 加载与 KT 共用同一份映射；
-不会创建额外的大文件或在内存中拼接整份权重。除最后一片外，切片大小必须是系统页大小
-的整数倍（上述发布版本的切片满足此条件）。目录中只放一套完整权重切片。
-如果 config.json、tokenizer.json、tokenizer_config.json 也在该目录，--model 同样使用
-/data2/models/DeepSeek-V3-GGUF。此改动不降低 KT 运行所需的 CPU 权重内存。
+python -u -m minisgl \
+  --host 127.0.0.1 --port 30000 \
+  --model /data2/models/DeepSeek-V3 \
+  --kt-weight-path /data2/models/DeepSeek-V3-GGUF \
+  --dtype bfloat16 --tp-size 1 --moe-backend kt \
+  --kt-cpuinfer 128 --kt-threadpool-count 2 --kt-method LLAMAFILE \
+  --attention-backend fi --cuda-graph-max-bs 0 \
+  --page-size 1 --num-pages 2048 --max-seq-len-override 2048 \
+  --max-prefill-length 2048 --max-running-requests 1
 
-四、发送测试请求（另开终端；V3 请将 model 改为 /data2/models/DeepSeek-V3）
+--model 只提供 config/tokenizer；全部模型权重从 --kt-weight-path 的 GGUF 读取。
+若需要从别的机器访问 API，启动成功后可将 --host 改为 0.0.0.0。
+
+6. 验证生成（另开终端执行；若启动的是 V3，把 model 值改为 V3 的 --model 路径）
 
 curl --fail-with-body http://127.0.0.1:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "/data2/models/Qwen3-30B-A3B",
-    "messages": [
-      {
-        "role": "user",
-        "content": "请用中文介绍一下混合专家模型 MoE 的工作原理。 /no_think"
-      }
-    ],
-    "temperature": 0,
-    "max_tokens": 256,
-    "stream": false
-  }'
+  -d '{"model":"/data2/models/Qwen3-30B-A3B","messages":[{"role":"user","content":"你好，请回复一句话。"}],"temperature":0,"max_tokens":32,"stream":false}'
+
+详细依赖说明见 docs/ktransformers.md。环境安装只需执行一次。以后每次新开终端：
+
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda activate minisgl-kt
+cd "$HOME/FlashKVMoE"
+
+如果使用了已有 Conda，第一行改为 source "$(conda info --base)/etc/profile.d/conda.sh"。
+然后重新执行第 2 步的 export 段，再启动服务。DeepSeek V3 的完整生成与峰值内存
+仍需在目标机器上实测。
+
+官方命令参考：
+Miniforge: https://github.com/conda-forge/miniforge
+HF 下载 CLI: https://huggingface.co/docs/huggingface_hub/package_reference/cli#hf-download
+Qwen GGUF: https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/tree/main
+DeepSeek V3 IQ4_XS: https://huggingface.co/mradermacher/DeepSeek-V3-GGUF/tree/main
