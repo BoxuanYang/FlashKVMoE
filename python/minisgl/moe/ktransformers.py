@@ -34,11 +34,16 @@ def load_ktransformers_experts(
     if gguf_weights is not None:
         from kt_kernel.utils.llamafile import LlamafileMoEWrapper
 
-        # Reuse our validated mapping through the pinned KT loader cache. In particular,
-        # KT must not rescan .partNofM files as if each were an independent GGUF.
-        LlamafileMoEWrapper._gguf_loaders_by_path[os.path.realpath(config.kt_weight_path)] = (
-            gguf_weights
-        )
+        # KT's older releases use a singleton; newer ones cache by path.
+        # Both must reuse our validated mapping of byte-split GGUF files.
+        if hasattr(LlamafileMoEWrapper, "_gguf_loaders_by_path"):
+            LlamafileMoEWrapper._gguf_loaders_by_path[os.path.realpath(config.kt_weight_path)] = (
+                gguf_weights
+            )
+        elif hasattr(LlamafileMoEWrapper, "_gguf_loader_instance"):
+            LlamafileMoEWrapper._gguf_loader_instance = gguf_weights
+        else:
+            raise RuntimeError("Installed kt-kernel LLAMAFILE loader is incompatible")
     max_graph_bs = max(cuda_graph_bs, default=0)
     # Replace the entire MLP BEFORE loading GPU weights, retaining its router
     # under mlp.gate so the Hugging Face checkpoint keys remain unchanged.

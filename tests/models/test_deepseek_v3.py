@@ -256,6 +256,7 @@ def test_legacy_v3_gguf_metadata(config, tmp_path):
     GGUFWeights(str(path), config)
 
 
+@pytest.mark.parametrize("legacy_kt_cache", [False, True])
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize(
     "byte_split",
@@ -267,7 +268,7 @@ def test_legacy_v3_gguf_metadata(config, tmp_path):
         ),
     ],
 )
-def test_gguf_and_model_state(config, tmp_path, monkeypatch, split, byte_split):
+def test_gguf_and_model_state(config, tmp_path, monkeypatch, split, byte_split, legacy_kt_cache):
     path = tmp_path / "v3.gguf"
     tensors = write_v3(path, config, split)
     if byte_split:
@@ -282,15 +283,23 @@ def test_gguf_and_model_state(config, tmp_path, monkeypatch, split, byte_split):
             )
     loader = GGUFWeights(str(path), config)
     cache = {}
+    kt_loader = (
+        SimpleNamespace(_gguf_loader_instance=None)
+        if legacy_kt_cache
+        else SimpleNamespace(_gguf_loaders_by_path=cache)
+    )
 
     def create_wrapper(**kwargs):
-        # Exercise the interface used by pinned KT without requiring its C++ kernel.
-        assert cache[os.path.realpath(kwargs["weight_path"])] is loader
+        # Exercise both KT loader caches without requiring its C++ kernel.
+        injected = (
+            kt_loader._gguf_loader_instance
+            if legacy_kt_cache
+            else cache[os.path.realpath(kwargs["weight_path"])]
+        )
+        assert injected is loader
         for proj in ("gate", "up", "down"):
             name = f"blk.{kwargs['layer_idx']}.ffn_{proj}_exps.weight"
-            packed, quant = cache[
-                os.path.realpath(kwargs["weight_path"])
-            ].get_undequanted_tensor_and_ggml_type(name)
+            packed, quant = injected.get_undequanted_tensor_and_ggml_type(name)
             assert quant == gguf.GGMLQuantizationType.F32
             assert packed.data_ptr() == loader.tensors[name].data.ctypes.data
             np.testing.assert_array_equal(packed.numpy(), tensors[name].view(np.uint8).reshape(-1))
@@ -301,7 +310,7 @@ def test_gguf_and_model_state(config, tmp_path, monkeypatch, split, byte_split):
     monkeypatch.setitem(
         sys.modules,
         "kt_kernel.utils.llamafile",
-        SimpleNamespace(LlamafileMoEWrapper=SimpleNamespace(_gguf_loaders_by_path=cache)),
+        SimpleNamespace(LlamafileMoEWrapper=kt_loader),
     )
     monkeypatch.setitem(sys.modules, "flashinfer", MagicMock())
     monkeypatch.setattr("minisgl.models.deepseek_v3.get_rope", lambda *args: None)
