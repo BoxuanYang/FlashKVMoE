@@ -7,6 +7,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from minisgl.utils import nvtx_annotate
 from minisgl.core import get_global_ctx
 from minisgl.layers import (
     BaseOP,
@@ -32,7 +33,7 @@ class DeepseekMLP(BaseOP):
         self.gate_up_proj = MarlinLinear(hidden, 2 * intermediate)
         self.down_proj = MarlinLinear(intermediate, hidden)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, layer_id=-1) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
 
@@ -65,13 +66,16 @@ class DeepseekMoEWrapper(BaseOP):
         )
         self._wrapper = None  # Installed by load_ktransformers_experts before loading GPU weights.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ids, weights = self.gate.forward(x)
+    def forward(self, x: torch.Tensor, layer_id=-1) -> torch.Tensor:
+        with torch.cuda.nvtx.range(f"MoE_{layer_id} Router"):
+            ids, weights = self.gate.forward(x)
+            shared = self.shared_experts.forward(x)
+
         stream = torch.cuda.current_stream(x.device).cuda_stream
         # KT's submit callback only enqueues CPU work. Shared GPU work runs before
         # the later sync callback waits for that work and copies its result back.
         self._wrapper.submit_forward(x, ids, weights, stream)
-        shared = self.shared_experts.forward(x)
+        
         routed = self._wrapper.sync_forward(x, stream)
         return shared + routed
 
@@ -132,6 +136,7 @@ class DeepseekMLA(BaseOP):
 
 class DeepseekDecoderLayer(BaseOP):
     def __init__(self, c: ModelConfig, layer_id: int):
+        self._layer_id = layer_id
         self.self_attn = DeepseekMLA(c, layer_id)
         self.mlp = (
             DeepseekMLP(c.hidden_size, c.intermediate_size)
@@ -141,11 +146,17 @@ class DeepseekDecoderLayer(BaseOP):
         self.input_layernorm = RMSNormFused(c.hidden_size, c.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(c.hidden_size, c.rms_norm_eps)
 
+    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None):
-        x, residual = self.input_layernorm.forward(x, residual)
-        x = self.self_attn.forward(x)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        return self.mlp.forward(x), residual
+        with torch.cuda.nvtx.range(f"Attention_{self._layer_id}"):
+            x, residual = self.input_layernorm.forward(x, residual)
+            x = self.self_attn.forward(x)
+            x, residual = self.post_attention_layernorm.forward(x, residual)
+
+        with torch.cuda.nvtx.range(f"MoE_{self._layer_id}"):
+            y = self.mlp.forward(x, self._layer_id)
+
+        return y, residual
 
 
 class DeepseekModel(BaseOP):
