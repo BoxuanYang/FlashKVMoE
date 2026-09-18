@@ -1,7 +1,7 @@
 终端 1：启动 minisgl
 cd ~/FlashKVMoE
 
-export NSYS_SESSION=minisgl_four
+export NSYS_SESSION=qwen235_minisgl_one
 
 CUDA_VISIBLE_DEVICES=2 \
 LOG_LEVEL=INFO \
@@ -14,12 +14,12 @@ nsys launch \
   python -u -m minisgl \
     --host 127.0.0.1 \
     --port 30000 \
-    --model /data2/models/Qwen3-30B-A3B \
+    --model /data1/models/Qwen3-235B-A22B-GGUF/IQ4_XS \
     --dtype bfloat16 \
     --tp-size 1 \
     --moe-backend kt \
-    --kt-weight-path /data2/models/Qwen3-30B-A3B-GGUF \
-    --kt-cpuinfer 128 \
+    --kt-weight-path /data1/models/Qwen3-235B-A22B-GGUF/IQ4_XS \
+    --kt-cpuinfer 64 \
     --kt-threadpool-count 2 \
     --kt-method LLAMAFILE \
     --attention-backend fi \
@@ -35,7 +35,7 @@ API server is ready to serve on 127.0.0.1:30000
 curl -sS http://127.0.0.1:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "/data2/models/Qwen3-30B-A3B",
+    "model": "/data1/models/Qwen3-235B-A22B-GGUF/IQ4_XS",
     "messages": [{"role": "user", "content": "Hello"}],
     "temperature": 0,
     "max_tokens": 16,
@@ -47,8 +47,8 @@ curl -sS http://127.0.0.1:30000/v1/chat/completions \
 cd ~/FlashKVMoE
 mkdir -p profiles
 
-export NSYS_SESSION=minisgl_four
-export NSYS_OUTPUT="$PWD/profiles/qwen3_single_$(date +%Y%m%d_%H%M%S)"
+export NSYS_SESSION=qwen235_minisgl_one
+export NSYS_OUTPUT="$PWD/profiles/qwen3_235b_single_$(date +%Y%m%d_%H%M%S)"
 
 nsys start \
   --session="$NSYS_SESSION" \
@@ -59,7 +59,7 @@ nsys start \
 curl -sS http://127.0.0.1:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "/data2/models/Qwen3-30B-A3B",
+    "model": "/data1/models/Qwen3-235B-A22B-GGUF/IQ4_XS",
     "messages": [
       {
         "role": "user",
