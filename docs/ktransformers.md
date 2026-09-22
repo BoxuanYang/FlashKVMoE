@@ -1,4 +1,6 @@
-# Qwen3 MoE：Mini-SGLang + KTransformers
+# Qwen3 MoE / DeepSeek Coder V2：Mini-SGLang + KTransformers
+
+DeepSeek-Coder-V2-Instruct 的 GPU router/shared experts、KT routed experts 和三段 IQ4_XS GGUF 启动命令见 [README](../README.md#quick-start-deepseek-coder-v2-instruct)。以下保留 Qwen3 说明与两者共用的安装流程。
 
 支持 Qwen3-30B-A3B、Qwen3-235B-A22B，全部模型权重从同一份完整 GGUF 加载。
 HF 目录或仓库只提供 config 和 tokenizer 等小文件，无需下载 safetensors。

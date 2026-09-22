@@ -1,10 +1,10 @@
 # FlashKVMoE
 
-Single GPU Qwen3 MoE inference with Mini-SGLang and the KTransformers (KT) CPU expert backend. The model uses **one complete GGUF checkpoint for all weights**. KT runs quantized experts on the CPU; GPU QKV/O projections and the LM head store **Marlin INT4 weights**, with dequantization fused into GEMM. Attention runs with FlashInfer.
+Single GPU Qwen3 MoE / DeepSeek-Coder-V2-Instruct inference with Mini-SGLang and the KTransformers (KT) CPU expert backend. The model uses **one complete GGUF checkpoint for all weights**. KT runs quantized experts on the CPU; GPU QKV/O projections and the LM head store **Marlin INT4 weights**, with dequantization fused into GEMM. Attention runs with FlashInfer.
 
-Supported models are Qwen3-30B-A3B and Qwen3-235B-A22B. Runtime requirements include Linux x86-64, an AVX2 CPU, an Ampere-or-newer NVIDIA GPU (including RTX 4090), a CUDA build toolchain, and the KT LLAMAFILE backend. Tensor parallelism and other model architectures are not supported by this integration.
+Supported models are Qwen3-30B-A3B, Qwen3-235B-A22B and DeepSeek-Coder-V2-Instruct. Runtime requirements include Linux x86-64, an AVX2 CPU, an Ampere-or-newer NVIDIA GPU (including RTX 4090), a CUDA build toolchain, and the KT LLAMAFILE backend. Tensor parallelism and other model architectures are not supported by this integration.
 
-Loading dequantizes GPU projection weights on the CPU and requantizes them to Marlin INT4, group size 64, before transferring them to the GPU. This adds quantization error; GGUF bytes cannot be passed directly to Marlin. Embedding, norms, router, activations and KV cache remain BF16. Both prefill and decode use Marlin projections.
+Loading dequantizes GPU projection weights on the CPU and requantizes them to Marlin INT4, group size 64, before transferring them to the GPU. This adds quantization error; GGUF bytes cannot be passed directly to Marlin. Embedding, norms, activations and KV cache remain BF16. The DeepSeek router uses FP32; the Qwen3 router uses BF16. Both prefill and decode use Marlin projections.
 
 The CUDA kernel is compiled directly from the pinned KT archive at first startup and cached by PyTorch. No CUDA source is copied, and the old archive Python runtime is not imported. Install this project in editable mode and retain the KT submodule.
 
@@ -38,12 +38,45 @@ python -m minisgl \
 
 `--moe-backend kt` is the only supported MoE backend and is selected by default. For Qwen3-235B-A22B, download all GGUF shards and point `--kt-weight-path` at their `Q4_K_M` directory. See the [model download and launch instructions](docs/ktransformers.md#2-权重) for the complete commands and hardware considerations.
 
+## Quick start: DeepSeek-Coder-V2-Instruct
+
+Using the existing lab checkpoint (all three `.gguf.partNof3` files must be present):
+
+```bash
+python -m minisgl \
+  --model deepseek-ai/DeepSeek-Coder-V2-Instruct \
+  --kt-weight-path /data1/models/DeepSeek-Coder-V2-Instruct-GGUF \
+  --dtype bfloat16 \
+  --tp-size 1 \
+  --attention-backend fi \
+  --page-size 1 \
+  --cuda-graph-max-bs 0 \
+  --num-pages 4096 \
+  --max-seq-len-override 4096 \
+  --max-prefill-length 512 \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 2
+```
+
+`--model` downloads only config/tokenizer files; it can also point to a local HF directory.
+Router and shared experts run on GPU; routed experts use KT on CPU. The call path is
+`layer.mlp (DeepseekMoE) -> KTMoEWrapper.forward`, with no intermediate expert adapter.
+Dense/shared MLPs and ordinary projections use Marlin INT4; absorbed MLA K/V projections
+and the compressed KV cache use BF16. Routing follows the
+[official V2 config](https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Instruct/blob/main/config.json):
+softmax, group-limited greedy, and a routed scaling factor of 16.
+
+On Linux, byte-split files are mapped as one contiguous checkpoint without creating a
+merged file or copying the whole checkpoint into RAM. All parts except the last must
+be page-aligned (normally 4096 bytes). This supports the supplied IQ4_XS filename layout.
+Full generation with these lab weights still needs validation on the target machine.
+
 ## Verification
 
 Run the GGUF loader and KT contract tests from the repository root:
 
 ```bash
-python -m pytest tests/models/test_marlin.py tests/models/test_gguf.py tests/moe -o addopts= -v
+python -m pytest tests/models/test_marlin.py tests/models/test_gguf.py tests/models/test_gguf_parts.py tests/models/test_deepseek_v2.py tests/moe -o addopts= -v
 ```
 
 CPU tests verify packing against the archive and real GGUF loading. Linux CUDA tests exercise Marlin GEMM and graph replay, KT experts, and FlashInfer Attention. GPU weight storage is approximately 1.21 GiB (30B) / 4.88 GiB (235B), excluding KV cache, workspaces and other runtime allocations. Full model generation and peak memory still need validation on the target GPU machine.

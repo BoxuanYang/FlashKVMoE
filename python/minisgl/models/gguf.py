@@ -1,8 +1,7 @@
-"""Qwen3 MoE GGUF: packed CPU experts and Marlin GPU projection weights."""
+"""Qwen3 MoE / DeepSeek Coder V2 GGUF: packed CPU experts and GPU projection weights."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Iterator
 
 import gguf
@@ -12,6 +11,7 @@ from minisgl.layers.marlin import pack_marlin
 from tqdm import tqdm
 
 from .config import ModelConfig
+from .gguf_parts import open_gguf_readers
 
 
 def _gpu_tensor_specs(config: ModelConfig) -> Iterator[tuple[str, str, tuple[int, ...]]]:
@@ -21,6 +21,9 @@ def _gpu_tensor_specs(config: ModelConfig) -> Iterator[tuple[str, str, tuple[int
     yield "output_norm.weight", "model.norm.weight", (hidden,)
     head = "token_embd.weight" if config.tie_word_embeddings else "output.weight"
     yield head, "lm_head.weight", (config.vocab_size, hidden)
+    if config.is_mla:
+        yield from _deepseek_tensor_specs(config)
+        return
     for layer in range(config.num_layers):
         src, dst = f"blk.{layer}", f"model.layers.{layer}"
         for proj, heads in (
@@ -49,6 +52,47 @@ def _gpu_tensor_specs(config: ModelConfig) -> Iterator[tuple[str, str, tuple[int
         yield f"{src}.ffn_gate_inp.weight", f"{dst}.mlp.gate.weight", (config.num_experts, hidden)
 
 
+def _deepseek_tensor_specs(c: ModelConfig) -> Iterator[tuple[str, str, tuple[int, ...]]]:
+    for layer in range(c.num_layers):
+        src, dst = f"blk.{layer}", f"model.layers.{layer}"
+        for name, target, shape in (
+            ("attn_q_a", "q_a_proj", (c.q_lora_rank, c.hidden_size)),
+            ("attn_q_a_norm", "q_a_layernorm", (c.q_lora_rank,)),
+            ("attn_q_b", "q_b_proj", (c.num_qo_heads * c.head_dim, c.q_lora_rank)),
+            (
+                "attn_kv_a_mqa",
+                "kv_a_proj_with_mqa",
+                (c.kv_lora_rank + c.qk_rope_head_dim, c.hidden_size),
+            ),
+            ("attn_kv_a_norm", "kv_a_layernorm", (c.kv_lora_rank,)),
+            ("attn_k_b", "k_b_proj", (c.num_qo_heads, c.kv_lora_rank, c.qk_nope_head_dim)),
+            ("attn_v_b", "v_b_proj", (c.num_qo_heads, c.v_head_dim, c.kv_lora_rank)),
+            ("attn_output", "o_proj", (c.hidden_size, c.num_qo_heads * c.v_head_dim)),
+        ):
+            yield f"{src}.{name}.weight", f"{dst}.self_attn.{target}.weight", shape
+        yield f"{src}.attn_norm.weight", f"{dst}.input_layernorm.weight", (c.hidden_size,)
+        yield f"{src}.ffn_norm.weight", f"{dst}.post_attention_layernorm.weight", (c.hidden_size,)
+        dense = layer < c.first_k_dense_replace
+        if not dense:
+            yield (
+                f"{src}.ffn_gate_inp.weight",
+                f"{dst}.mlp.gate.weight",
+                (
+                    c.num_experts,
+                    c.hidden_size,
+                ),
+            )
+        intermediate = (
+            c.intermediate_size if dense else c.n_shared_experts * c.moe_intermediate_size
+        )
+        suffix, mlp = ("", f"{dst}.mlp") if dense else ("_shexp", f"{dst}.mlp.shared_experts")
+        for proj in ("gate", "up", "down"):
+            shape = (
+                (c.hidden_size, intermediate) if proj == "down" else (intermediate, c.hidden_size)
+            )
+            yield f"{src}.ffn_{proj}{suffix}.weight", f"{mlp}.{proj}_proj.weight", shape
+
+
 class GGUFWeights:
     """Index and validate a complete checkpoint without unpacking any expert tensors.
 
@@ -57,14 +101,13 @@ class GGUFWeights:
     """
 
     def __init__(self, path: str, config: ModelConfig):
-        if config.architectures != ["Qwen3MoeForCausalLM"]:
-            raise ValueError("GGUF GPU weight loading currently supports Qwen3 MoE only")
-        source = Path(path)
-        files = sorted(source.glob("*.gguf")) if source.is_dir() else [source]
-        if not files or any(not f.is_file() or f.suffix != ".gguf" for f in files):
-            raise FileNotFoundError(f"No GGUF checkpoint found at {path}")
+        if config.architectures not in (["Qwen3MoeForCausalLM"], ["DeepseekV2ForCausalLM"]):
+            raise ValueError(
+                "GGUF GPU weight loading supports Qwen3 MoE and DeepSeek Coder V2 only"
+            )
+        architecture_name = "deepseek2" if config.is_mla else "qwen3moe"
         # Readers mmap the packed data. Keep them alive until weight iteration completes.
-        self.readers = [gguf.GGUFReader(str(file), mode="r") for file in files]
+        self.readers = open_gguf_readers(path)
         self.tensors = {}
         self.config = config
         shard_ids = []
@@ -74,12 +117,14 @@ class GGUFWeights:
             fields = reader.fields
             architecture = fields.get("general.architecture")
             if (index == 0 and architecture is None) or (
-                architecture is not None and architecture.contents() != "qwen3moe"
+                architecture is not None and architecture.contents() != architecture_name
             ):
-                raise ValueError("Expected general.architecture=qwen3moe in the first GGUF shard")
+                raise ValueError(
+                    f"Expected general.architecture={architecture_name} in the first GGUF shard"
+                )
             count = fields.get("split.count")
             if count is not None:
-                if count.contents() != len(files) or "split.no" not in fields:
+                if count.contents() != len(self.readers) or "split.no" not in fields:
                     raise ValueError("Incomplete GGUF shards: pass a directory with all shards")
                 shard_ids.append(fields["split.no"].contents())
             for tensor in reader.tensors:
@@ -88,13 +133,26 @@ class GGUFWeights:
                         f"Duplicate GGUF tensor {tensor.name}; use one quantization only"
                     )
                 self.tensors[tensor.name] = tensor
-        if shard_ids and sorted(shard_ids) != list(range(len(files))):
+        if shard_ids and sorted(shard_ids) != list(range(len(self.readers))):
             raise ValueError("Inconsistent GGUF split metadata or duplicate shard indices")
-        if len(files) > 1 and not shard_ids:
+        if len(self.readers) > 1 and not shard_ids:
             raise ValueError("Multiple GGUF files without split metadata; select one checkpoint")
 
         expected = {name: shape for name, _, shape in _gpu_tensor_specs(config)}
+        # Older GGUFs keep KV-B combined; current llama.cpp splits/transposes K-B.
+        if config.is_mla:
+            for layer in range(config.num_layers):
+                src = f"blk.{layer}"
+                if f"{src}.attn_kv_b.weight" in self.tensors:
+                    expected.pop(f"{src}.attn_k_b.weight")
+                    expected.pop(f"{src}.attn_v_b.weight")
+                    expected[f"{src}.attn_kv_b.weight"] = (
+                        config.num_qo_heads * (config.qk_nope_head_dim + config.v_head_dim),
+                        config.kv_lora_rank,
+                    )
         for layer in range(config.num_layers):
+            if config.is_mla and layer < config.first_k_dense_replace:
+                continue
             for proj in ("gate", "up", "down"):
                 dims = (config.moe_intermediate_size, config.hidden_size)
                 if proj == "down":
@@ -103,9 +161,7 @@ class GGUFWeights:
         for name, shape in expected.items():
             tensor = self.tensors.get(name)
             if tensor is None:
-                raise ValueError(
-                    f"Missing GGUF tensor {name}; pass a complete Qwen3 MoE GGUF checkpoint"
-                )
+                raise ValueError(f"Missing GGUF tensor {name}; pass a complete GGUF checkpoint")
             actual = tuple(int(dim) for dim in tensor.shape[::-1])
             if actual != shape:
                 raise ValueError(f"GGUF tensor {name}: expected shape {shape}, got {actual}")
@@ -124,13 +180,46 @@ class GGUFWeights:
             "rope.freq_base": config.rotary_config.base,
             "attention.layer_norm_rms_epsilon": config.rms_norm_eps,
         }
+        if config.is_mla:
+            # Older DeepSeek GGUFs describe expanded heads; newer ones describe
+            # the compressed MLA cache. Both contain the same attention tensors.
+            kv_heads = self.readers[0].fields.get(f"{architecture_name}.attention.head_count_kv")
+            compressed_kv = kv_heads is not None and kv_heads.contents() == 1
+            metadata.update(
+                {
+                    "attention.head_count_kv": 1 if compressed_kv else config.num_kv_heads,
+                    "attention.key_length": (
+                        config.kv_lora_rank + config.qk_rope_head_dim
+                        if compressed_kv
+                        else config.head_dim
+                    ),
+                    "attention.value_length": (
+                        config.kv_lora_rank if compressed_kv else config.v_head_dim
+                    ),
+                    "attention.key_length_mla": config.head_dim,
+                    "attention.value_length_mla": config.v_head_dim,
+                    "attention.q_lora_rank": config.q_lora_rank,
+                    "attention.kv_lora_rank": config.kv_lora_rank,
+                    "rope.dimension_count": config.qk_rope_head_dim,
+                    "leading_dense_block_count": config.first_k_dense_replace,
+                    "expert_shared_count": config.n_shared_experts,
+                }
+            )
         for reader in self.readers:
             for key, expected_value in metadata.items():
-                field = reader.fields.get(f"qwen3moe.{key}")
+                field = reader.fields.get(f"{architecture_name}.{key}")
                 if field is not None and not np.isclose(
                     field.contents(), expected_value, rtol=1e-6, atol=0
                 ):
-                    raise ValueError(f"GGUF metadata qwen3moe.{key} does not match --model config")
+                    raise ValueError(
+                        f"GGUF metadata {architecture_name}.{key}={field.contents()} "
+                        f"does not match --model config ({expected_value})"
+                    )
+
+    def get_undequanted_tensor_and_ggml_type(self, name: str):
+        """KT's loader protocol: a packed byte view, never a dequantized expert copy."""
+        tensor = self.tensors[name]
+        return torch.from_numpy(tensor.data.view(np.uint8).reshape(-1)), tensor.tensor_type
 
     def _dequantize(
         self, name: str, device: torch.device, dtype: torch.dtype, chunk_bytes: int
@@ -158,22 +247,58 @@ class GGUFWeights:
     def weights(
         self, device: torch.device, dtype: torch.dtype, *, chunk_bytes: int = 16 * 1024 * 1024
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        """Pack QKV/O/head on CPU, then transfer only INT4 weights and BF16 scales."""
-        qkv = []
+        """Pack ordinary linear layers on CPU; keep absorbed MLA projections in BF16."""
+        merged = []
+        combined_kv = None
         specs = list(_gpu_tensor_specs(self.config))
         for source, target, _ in tqdm(specs, desc="Loading GGUF GPU weights"):
-            is_qkv = target.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight"))
-            is_marlin = is_qkv or target.endswith((".o_proj.weight", "lm_head.weight"))
-            weight = self._dequantize(
-                source, torch.device("cpu") if is_marlin else device, dtype, chunk_bytes
-            )
-            if is_qkv:
-                qkv.append(weight)
-                if len(qkv) < 3:
+            if self.config.is_mla and source.endswith((".attn_k_b.weight", ".attn_v_b.weight")):
+                combined_source = source.rsplit(".", 2)[0] + ".attn_kv_b.weight"
+                if combined_source in self.tensors:
+                    c = self.config
+                    if source.endswith(".attn_k_b.weight"):
+                        combined_kv = self._dequantize(
+                            combined_source, device, dtype, chunk_bytes
+                        ).view(c.num_qo_heads, c.qk_nope_head_dim + c.v_head_dim, c.kv_lora_rank)
+                        yield (
+                            target,
+                            combined_kv[:, : c.qk_nope_head_dim].transpose(1, 2).contiguous(),
+                        )
+                    else:
+                        yield target, combined_kv[:, c.qk_nope_head_dim :].contiguous()
+                        combined_kv = None
                     continue
-                target = target.replace(".v_proj.weight", ".qkv_proj.weight")
-                weight = torch.cat(qkv)
-                qkv.clear()
+            is_qkv = target.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight"))
+            is_gate_up = target.endswith((".gate_proj.weight", ".up_proj.weight"))
+            is_marlin = (
+                is_qkv
+                or is_gate_up
+                or target.endswith(
+                    (
+                        ".o_proj.weight",
+                        "lm_head.weight",
+                        ".q_a_proj.weight",
+                        ".q_b_proj.weight",
+                        ".kv_a_proj_with_mqa.weight",
+                        ".down_proj.weight",
+                    )
+                )
+            )
+            tensor_dtype = torch.float32 if self.config.is_mla and ".mlp.gate." in target else dtype
+            weight = self._dequantize(
+                source, torch.device("cpu") if is_marlin else device, tensor_dtype, chunk_bytes
+            )
+            if is_qkv or is_gate_up:
+                merged.append(weight)
+                if len(merged) < (3 if is_qkv else 2):
+                    continue
+                target = (
+                    target.replace(".v_proj.weight", ".qkv_proj.weight")
+                    if is_qkv
+                    else target.replace(".up_proj.weight", ".gate_up_proj.weight")
+                )
+                weight = torch.cat(merged)
+                merged.clear()
             if is_marlin:
                 packed, scales = pack_marlin(weight)
                 yield target, packed.to(device)

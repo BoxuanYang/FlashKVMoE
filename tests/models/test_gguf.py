@@ -190,14 +190,16 @@ def test_mixed_gguf_loads_complete_gpu_state(checkpoint, config, monkeypatch):
     torch.testing.assert_close(projection.weight, qkv_weight)
 
 
-@pytest.mark.parametrize("quant", [Q.Q4_K, Q.Q6_K])
+@pytest.mark.parametrize("quant", [Q.Q4_K, Q.Q6_K, Q.IQ4_XS])
 def test_k_quantized_gpu_weights(tmp_path, config, quant):
     tensors = checkpoint_tensors(config)
     _, block_bytes = gguf.GGML_QUANT_SIZES[quant]
     # Finite, nonzero packed K-quant blocks. These quantizers only implement dequantization.
     data = np.full((256, block_bytes), 17, dtype=np.uint8)
     scale = np.array([0.001], dtype=np.float16).view(np.uint8)
-    if quant == Q.Q4_K:
+    if quant == Q.IQ4_XS:
+        data[:, :2] = scale
+    elif quant == Q.Q4_K:
         data[:, :2] = scale
         data[:, 2:4] = scale
     else:
