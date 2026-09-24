@@ -78,11 +78,24 @@ def test_zero_groups_and_output_padding():
     assert (scales == 1).all()
 
 
+def test_input_padding():
+    weight = torch.randn(67, 192, generator=torch.Generator().manual_seed(5)).to(torch.bfloat16)
+    expected_weight, expected_scales = pack_marlin(F.pad(weight, (0, 64)))
+    packed, scales = pack_marlin(weight)
+    torch.testing.assert_close(packed, expected_weight, rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+    with torch.device("meta"):
+        layer = MarlinLinear(192, 67)
+    assert layer.weight.shape == packed.shape and layer.scales.shape == scales.shape
+
+
 @pytest.mark.skipif(
     sys.platform != "linux" or not torch.cuda.is_available(), reason="requires Linux CUDA"
 )
 @pytest.mark.parametrize(
-    "n,k", [(67, 256), (5120, 2048), (2048, 4096), (9216, 4096), (4096, 8192), (151936, 128)]
+    "n,k",
+    [(67, 192), (67, 256), (5120, 2048), (2048, 4096), (9216, 4096), (4096, 8192), (151936, 128)],
 )
 def test_cuda_gemm_and_graph(n, k):
     weight = (torch.randn(n, k) * 0.03).to(torch.bfloat16)

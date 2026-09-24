@@ -23,7 +23,7 @@ def glm_config(**overrides):
         "architectures": ["Glm4MoeForCausalLM"],
         "num_hidden_layers": 2,
         "hidden_size": 256,
-        "intermediate_size": 512,
+        "intermediate_size": 192,
         "moe_intermediate_size": 128,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,

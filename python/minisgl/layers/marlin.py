@@ -58,8 +58,10 @@ def pack_marlin(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.device.type != "cpu" or weight.dtype != torch.bfloat16 or weight.ndim != 2:
         raise ValueError("Marlin packing requires a CPU BF16 matrix")
     n, k = weight.shape
-    if k % 128:
-        raise ValueError("Marlin input features must be divisible by 128")
+    padded_k = (k + 127) // 128 * 128
+    if padded_k != k:
+        weight = torch.nn.functional.pad(weight, (0, padded_k - k))
+        k = padded_k
     padded_n = (n + 63) // 64 * 64
     packed = torch.empty(k // 16, padded_n * 2, dtype=torch.int32, device="cpu")
     scales = torch.empty(k // 64, padded_n, dtype=torch.bfloat16, device="cpu")
@@ -87,12 +89,13 @@ def pack_marlin(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 class MarlinLinear(BaseOP):
     def __init__(self, input_size: int, output_size: int):
-        if input_size % 128:
-            raise ValueError("Marlin input features must be divisible by 128")
         self.input_size, self.output_size = input_size, output_size
+        self.padded_input = (input_size + 127) // 128 * 128
         self.padded_output = (output_size + 63) // 64 * 64
-        self.weight = torch.empty(input_size // 16, self.padded_output * 2, dtype=torch.int32)
-        self.scales = torch.empty(input_size // 64, self.padded_output, dtype=torch.bfloat16)
+        self.weight = torch.empty(
+            self.padded_input // 16, self.padded_output * 2, dtype=torch.int32
+        )
+        self.scales = torch.empty(self.padded_input // 64, self.padded_output, dtype=torch.bfloat16)
         self._workspace = self._empty = None
 
     def load_state_dict(self, state_dict, *, prefix="", _internal=False):
@@ -109,6 +112,8 @@ class MarlinLinear(BaseOP):
             raise RuntimeError("Marlin weights have not been loaded")
         shape = x.shape[:-1]
         x = x.reshape(-1, self.input_size).contiguous()
+        if self.padded_input != self.input_size:
+            x = torch.nn.functional.pad(x, (0, self.padded_input - self.input_size))
         y = marlin_gemm()(
             x,
             self.weight,
@@ -119,7 +124,7 @@ class MarlinLinear(BaseOP):
             4,
             x.shape[0],
             self.padded_output,
-            self.input_size,
+            self.padded_input,
             True,
         )
         return y[:, : self.output_size].reshape(*shape, self.output_size)
