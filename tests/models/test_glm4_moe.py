@@ -69,7 +69,7 @@ def write_shards(path, config):
             (config.hidden_size, config.num_qo_heads * config.head_dim),
         )
         add(f"{p}.attn_norm.weight", (config.hidden_size,), True)
-        add(f"{p}.ffn_norm.weight", (config.hidden_size,), True)
+        add(f"{p}.post_attention_norm.weight", (config.hidden_size,), True)
         if layer >= config.first_k_dense_replace:
             add(f"{p}.ffn_gate_inp.weight", (config.num_experts, config.hidden_size))
             add(f"{p}.exp_probs_b.bias", (config.num_experts,))

@@ -85,7 +85,11 @@ def _glm4_moe_tensor_specs(c: ModelConfig) -> Iterator[tuple[str, str, tuple[int
             (c.hidden_size, c.num_qo_heads * c.head_dim),
         )
         yield f"{src}.attn_norm.weight", f"{dst}.input_layernorm.weight", (c.hidden_size,)
-        yield f"{src}.ffn_norm.weight", f"{dst}.post_attention_layernorm.weight", (c.hidden_size,)
+        yield (
+            f"{src}.post_attention_norm.weight",
+            f"{dst}.post_attention_layernorm.weight",
+            (c.hidden_size,),
+        )
         dense = layer < c.first_k_dense_replace
         if not dense:
             yield (
