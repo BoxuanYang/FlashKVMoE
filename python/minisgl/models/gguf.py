@@ -276,6 +276,8 @@ class GGUFWeights:
                 }
             )
         elif config.is_glm4_moe:
+            nextn = self.readers[0].fields.get(f"{architecture_name}.nextn_predict_layers")
+            metadata["block_count"] += nextn.contents() if nextn is not None else 0
             metadata.update(
                 {
                     "rope.dimension_count": config.rotary_config.rotary_dim,

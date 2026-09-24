@@ -97,6 +97,8 @@ def write_shards(path, config):
     entries = list(tensors.items())
     for shard in range(2):
         writer = gguf.GGUFWriter(str(path / f"glm-{shard + 1:05d}-of-00002.gguf"), "glm4moe")
+        writer.add_block_count(config.num_layers + 1)
+        writer.add_uint32("glm4moe.nextn_predict_layers", 1)
         writer.add_uint16("split.no", shard)
         writer.add_uint16("split.count", 2)
         for name, tensor in entries[shard::2]:
