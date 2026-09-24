@@ -1,6 +1,6 @@
 [submodule "third_party/ktransformers"]
 	path = third_party/ktransformers
-	url = https://github.com/kvcache-ai/ktransformers.git
+	url = https://github.com/BoxuanYang/ktransformers.git
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
