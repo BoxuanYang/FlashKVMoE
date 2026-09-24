@@ -53,6 +53,10 @@ class ModelConfig:
     def is_moe(self) -> bool:
         return self.num_experts > 0
 
+    @property
+    def is_glm4_moe(self) -> bool:
+        return self.model_type == "glm4_moe"
+
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
         if hasattr(config, "text_config") and config.text_config is not None:
@@ -68,12 +72,17 @@ class ModelConfig:
         )
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         model_type = getattr(config, "model_type", "llama")
-        num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
+        num_experts = getattr(
+            config,
+            "num_local_experts",
+            getattr(config, "num_experts", getattr(config, "n_routed_experts", 0)),
+        )
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
         mla = model_type == "deepseek_v2"
+        shared_moe = mla or model_type == "glm4_moe"
         if mla:
             if (config.scoring_func, config.topk_method, config.moe_layer_freq) != (
                 "softmax",
@@ -106,7 +115,11 @@ class ModelConfig:
             tie_word_embeddings=tie_word_embeddings,
             rotary_config=RotaryConfig(
                 head_dim=config.qk_rope_head_dim if mla else head_dim,
-                rotary_dim=config.qk_rope_head_dim if mla else head_dim,
+                rotary_dim=(
+                    config.qk_rope_head_dim
+                    if mla
+                    else int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
+                ),
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=rope_scaling,
@@ -121,16 +134,25 @@ class ModelConfig:
                 {
                     name: getattr(config, name)
                     for name in (
-                        "q_lora_rank",
-                        "kv_lora_rank",
-                        "qk_nope_head_dim",
-                        "qk_rope_head_dim",
-                        "v_head_dim",
                         "first_k_dense_replace",
                         "n_shared_experts",
                         "n_group",
                         "topk_group",
                         "routed_scaling_factor",
+                    )
+                }
+                if shared_moe
+                else {}
+            ),
+            **(
+                {
+                    name: getattr(config, name)
+                    for name in (
+                        "q_lora_rank",
+                        "kv_lora_rank",
+                        "qk_nope_head_dim",
+                        "qk_rope_head_dim",
+                        "v_head_dim",
                     )
                 }
                 if mla

@@ -234,8 +234,9 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.architectures not in (
         ["Qwen3MoeForCausalLM"],
         ["DeepseekV2ForCausalLM"],
+        ["Glm4MoeForCausalLM"],
     ):
-        raise ValueError("KT supports Qwen3 MoE and DeepSeek Coder V2 only")
+        raise ValueError("KT supports Qwen3 MoE, DeepSeek Coder V2 and GLM-4 MoE only")
     if config.tp_info.size != 1:
         raise ValueError("KT requires --tp-size 1")
     if config.dtype != torch.bfloat16:
@@ -252,7 +253,9 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_mla:
         model = config.model_config
         if (model.kv_lora_rank, model.qk_rope_head_dim) != (512, 64) or model.q_lora_rank <= 0:
-            raise ValueError("DeepSeek Coder V2 MLA requires kv_lora_rank=512, rope_dim=64 and Q LoRA")
+            raise ValueError(
+                "DeepSeek Coder V2 MLA requires kv_lora_rank=512, rope_dim=64 and Q LoRA"
+            )
         if config.attention_backend == "auto":
             override("attention_backend", "fi")
         if config.attention_backend != "fi" or config.page_size != 1:

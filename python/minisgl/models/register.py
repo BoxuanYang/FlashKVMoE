@@ -4,6 +4,7 @@ from .config import ModelConfig
 
 _MODEL_REGISTRY = {
     "DeepseekV2ForCausalLM": (".deepseek_v2", "DeepseekV2ForCausalLM"),
+    "Glm4MoeForCausalLM": (".glm4_moe", "Glm4MoeForCausalLM"),
     "LlamaForCausalLM": (".llama", "LlamaForCausalLM"),
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),

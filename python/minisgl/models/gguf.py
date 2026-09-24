@@ -1,4 +1,4 @@
-"""Qwen3 MoE / DeepSeek Coder V2 GGUF: packed CPU experts and GPU projection weights."""
+"""MoE GGUF: packed CPU experts and GPU projection weights."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ def _gpu_tensor_specs(config: ModelConfig) -> Iterator[tuple[str, str, tuple[int
     yield head, "lm_head.weight", (config.vocab_size, hidden)
     if config.is_mla:
         yield from _deepseek_tensor_specs(config)
+        return
+    if config.is_glm4_moe:
+        yield from _glm4_moe_tensor_specs(config)
         return
     for layer in range(config.num_layers):
         src, dst = f"blk.{layer}", f"model.layers.{layer}"
@@ -50,6 +53,63 @@ def _gpu_tensor_specs(config: ModelConfig) -> Iterator[tuple[str, str, tuple[int
         yield f"{src}.attn_norm.weight", f"{dst}.input_layernorm.weight", (hidden,)
         yield f"{src}.ffn_norm.weight", f"{dst}.post_attention_layernorm.weight", (hidden,)
         yield f"{src}.ffn_gate_inp.weight", f"{dst}.mlp.gate.weight", (config.num_experts, hidden)
+
+
+def _glm4_moe_tensor_specs(c: ModelConfig) -> Iterator[tuple[str, str, tuple[int, ...]]]:
+    for layer in range(c.num_layers):
+        src, dst = f"blk.{layer}", f"model.layers.{layer}"
+        for proj, heads in (
+            ("q", c.num_qo_heads),
+            ("k", c.num_kv_heads),
+            ("v", c.num_kv_heads),
+        ):
+            size = heads * c.head_dim
+            yield (
+                f"{src}.attn_{proj}.weight",
+                f"{dst}.self_attn.{proj}_proj.weight",
+                (
+                    size,
+                    c.hidden_size,
+                ),
+            )
+        for proj, heads in (
+            ("q", c.num_qo_heads),
+            ("k", c.num_kv_heads),
+            ("v", c.num_kv_heads),
+        ):
+            size = heads * c.head_dim
+            yield f"{src}.attn_{proj}.bias", f"{dst}.self_attn.{proj}_proj.bias", (size,)
+        yield (
+            f"{src}.attn_output.weight",
+            f"{dst}.self_attn.o_proj.weight",
+            (c.hidden_size, c.num_qo_heads * c.head_dim),
+        )
+        yield f"{src}.attn_norm.weight", f"{dst}.input_layernorm.weight", (c.hidden_size,)
+        yield f"{src}.ffn_norm.weight", f"{dst}.post_attention_layernorm.weight", (c.hidden_size,)
+        dense = layer < c.first_k_dense_replace
+        if not dense:
+            yield (
+                f"{src}.ffn_gate_inp.weight",
+                f"{dst}.mlp.gate.weight",
+                (
+                    c.num_experts,
+                    c.hidden_size,
+                ),
+            )
+            yield (
+                f"{src}.exp_probs_b.bias",
+                f"{dst}.mlp.gate.e_score_correction_bias",
+                (c.num_experts,),
+            )
+        intermediate = (
+            c.intermediate_size if dense else c.n_shared_experts * c.moe_intermediate_size
+        )
+        suffix, mlp = ("", f"{dst}.mlp") if dense else ("_shexp", f"{dst}.mlp.shared_experts")
+        for proj in ("gate", "up", "down"):
+            shape = (
+                (c.hidden_size, intermediate) if proj == "down" else (intermediate, c.hidden_size)
+            )
+            yield f"{src}.ffn_{proj}{suffix}.weight", f"{mlp}.{proj}_proj.weight", shape
 
 
 def _deepseek_tensor_specs(c: ModelConfig) -> Iterator[tuple[str, str, tuple[int, ...]]]:
@@ -101,11 +161,17 @@ class GGUFWeights:
     """
 
     def __init__(self, path: str, config: ModelConfig):
-        if config.architectures not in (["Qwen3MoeForCausalLM"], ["DeepseekV2ForCausalLM"]):
+        if config.architectures not in (
+            ["Qwen3MoeForCausalLM"],
+            ["DeepseekV2ForCausalLM"],
+            ["Glm4MoeForCausalLM"],
+        ):
             raise ValueError(
-                "GGUF GPU weight loading supports Qwen3 MoE and DeepSeek Coder V2 only"
+                "GGUF GPU weight loading supports Qwen3 MoE, DeepSeek Coder V2 and GLM-4 MoE only"
             )
-        architecture_name = "deepseek2" if config.is_mla else "qwen3moe"
+        architecture_name = (
+            "deepseek2" if config.is_mla else "glm4moe" if config.is_glm4_moe else "qwen3moe"
+        )
         # Readers mmap the packed data. Keep them alive until weight iteration completes.
         self.readers = open_gguf_readers(path)
         self.tensors = {}
@@ -151,7 +217,7 @@ class GGUFWeights:
                         config.kv_lora_rank,
                     )
         for layer in range(config.num_layers):
-            if config.is_mla and layer < config.first_k_dense_replace:
+            if (config.is_mla or config.is_glm4_moe) and layer < config.first_k_dense_replace:
                 continue
             for proj in ("gate", "up", "down"):
                 dims = (config.moe_intermediate_size, config.hidden_size)
@@ -201,6 +267,14 @@ class GGUFWeights:
                     "attention.q_lora_rank": config.q_lora_rank,
                     "attention.kv_lora_rank": config.kv_lora_rank,
                     "rope.dimension_count": config.qk_rope_head_dim,
+                    "leading_dense_block_count": config.first_k_dense_replace,
+                    "expert_shared_count": config.n_shared_experts,
+                }
+            )
+        elif config.is_glm4_moe:
+            metadata.update(
+                {
+                    "rope.dimension_count": config.rotary_config.rotary_dim,
                     "leading_dense_block_count": config.first_k_dense_replace,
                     "expert_shared_count": config.n_shared_experts,
                 }
@@ -269,6 +343,7 @@ class GGUFWeights:
                         combined_kv = None
                     continue
             is_qkv = target.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight"))
+            is_qkv_bias = target.endswith((".q_proj.bias", ".k_proj.bias", ".v_proj.bias"))
             is_gate_up = target.endswith((".gate_proj.weight", ".up_proj.weight"))
             is_marlin = (
                 is_qkv
@@ -284,18 +359,26 @@ class GGUFWeights:
                     )
                 )
             )
-            tensor_dtype = torch.float32 if self.config.is_mla and ".mlp.gate." in target else dtype
+            tensor_dtype = (
+                torch.float32
+                if (self.config.is_mla or self.config.is_glm4_moe) and ".mlp.gate." in target
+                else dtype
+            )
             weight = self._dequantize(
                 source, torch.device("cpu") if is_marlin else device, tensor_dtype, chunk_bytes
             )
-            if is_qkv or is_gate_up:
+            if is_qkv or is_qkv_bias or is_gate_up:
                 merged.append(weight)
-                if len(merged) < (3 if is_qkv else 2):
+                if len(merged) < (3 if is_qkv or is_qkv_bias else 2):
                     continue
                 target = (
                     target.replace(".v_proj.weight", ".qkv_proj.weight")
                     if is_qkv
-                    else target.replace(".up_proj.weight", ".gate_up_proj.weight")
+                    else (
+                        target.replace(".v_proj.bias", ".qkv_bias")
+                        if is_qkv_bias
+                        else target.replace(".up_proj.weight", ".gate_up_proj.weight")
+                    )
                 )
                 weight = torch.cat(merged)
                 merged.clear()

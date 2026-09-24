@@ -42,7 +42,7 @@ def load_ktransformers_experts(
     # Replace the entire MLP BEFORE loading GPU weights, retaining its router
     # under mlp.gate so the Hugging Face checkpoint keys remain unchanged.
     for layer_id, layer in enumerate(model.model.layers.op_list):
-        if config.model_config.is_mla:
+        if config.model_config.is_mla or config.model_config.is_glm4_moe:
             if layer_id >= config.model_config.first_k_dense_replace:
                 layer.mlp._wrapper = _create_kt_wrapper(config, layer_id, max_graph_bs)
             continue
