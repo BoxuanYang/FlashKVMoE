@@ -1,123 +1,52 @@
-"""CPU checks for the benchmark's inputs, result aggregation, and regression."""
+"""CPU checks for callback timing and the standalone analysis script."""
 
 import importlib.util
+import json
+import runpy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
-import numpy as np
 import pytest
-import torch
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "benchmark" / "offline"
 
 
-def load_script(name):
-    path = Path(__file__).resolve().parents[2] / "benchmark" / "offline" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def test_callback_times_only_synchronous_expert_forward():
+    spec = importlib.util.spec_from_file_location("bench", SCRIPTS / "bench_glm_moe_decode.py")
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    assert list(bench.BATCH_SIZES) == list(range(1, 129))
+    assert bench.REPEATS == 20
+    bench.experts = SimpleNamespace(forward=Mock())
+    bench.forward_args = (1, 2, 3, 4, 5, 6, False)
+    bench.callback_error = None
+    bench.time = SimpleNamespace(perf_counter_ns=Mock(side_effect=[100, 2_500_100]))
+    bench.timed_experts(None)
+    bench.experts.forward.assert_called_once_with(*bench.forward_args)
+    assert bench.elapsed_ms == 2.5
+    assert bench.callback_error is None
+    bench.experts.forward.side_effect = RuntimeError("CPU failure")
+    bench.time.perf_counter_ns = Mock(return_value=0)
+    bench.timed_experts(None)
+    assert str(bench.callback_error) == "CPU failure"
 
 
-bench = load_script("bench_glm_moe_decode")
-analysis = load_script("analyze_glm_moe_decode")
-
-
-def test_defaults_and_invalid_batch_sizes():
-    args = bench.parse_args(["--kt-weight-path", "unused"])
-    assert args.batch_sizes == [1, 2, 4, 8, 16, 24, 32, 64, 128]
-    assert (args.kt_cpuinfer, args.kt_threadpool_count, args.layer_index) == (64, 2, 7)
-    for values in (["0"], ["2", "2"]):
-        with pytest.raises(SystemExit):
-            bench.parse_args(["--kt-weight-path", "unused", "--batch-sizes", *values])
-
-
-def test_independent_inputs_change_between_replays():
-    args = SimpleNamespace(seed=42, hidden_states=None)
-    source = bench.InputSource(args, 64, torch.device("cpu"))
-    x = torch.empty(128, 64)
-    source.fill(x)
-    first = x.clone()
-    assert torch.unique(x, dim=0).shape[0] == 128
-    source.fill(x)
-    assert not torch.equal(x, first)
-    # The same seed reproduces the input sequence.
-    bench.InputSource(args, 64, torch.device("cpu")).fill(x)
-    torch.testing.assert_close(x, first)
-
-
-def test_real_input_rows_are_sampled_independently(tmp_path):
-    path = tmp_path / "inputs.npy"
-    pool = np.arange(256 * 64, dtype=np.float32).reshape(256, 64) / 1000
-    np.save(path, pool)
-    args = SimpleNamespace(seed=42, hidden_states=path, batch_sizes=[1, 128])
-    source = bench.InputSource(args, 64, torch.device("cpu"))
-    x = torch.empty(128, 64)
-    source.fill(x)
-    assert torch.unique(x, dim=0).shape[0] == 128
-    assert all(any(np.array_equal(row, candidate) for candidate in pool) for row in x.numpy())
-
-
-def test_json_aggregation(tmp_path):
-    result = bench.summarize([1.0, 2.0, 3.0, 4.0], [1.5, 3.5], [4, 4], [2, 2], [1, 2])
-    assert result["avg_ms"] == 2.5
-    assert result["num_measurements"] == 4
-    assert result["routing"]["avg_unique_expert_sets_per_batch"] == 1.5
-    path = tmp_path / "result.json"
-    bench.write_json(path, result)
-    import json
-
-    assert json.loads(path.read_text())["avg_ms"] == 2.5
-    assert not path.with_suffix(".json.tmp").exists()
-
-
-def test_linear_regression_uses_numeric_batch_sizes():
+def test_analysis_fits_all_128_sizes_and_writes_plot(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("results").mkdir()
     data = {
         "complete": True,
-        "results": [
-            {"batch_size": bs, "avg_ms": 0.125 * bs + 2.0}
-            for bs in reversed(bench.DEFAULT_BATCH_SIZES)
-        ],
+        "results": [{"batch_size": b, "avg_ms": 2 + 0.125 * b} for b in range(128, 0, -1)],
     }
-    rows, fit = analysis.fit_results(data)
-    assert [row["batch_size"] for row in rows] == bench.DEFAULT_BATCH_SIZES
+    Path("results/glm_moe_decode.json").write_text(json.dumps(data), encoding="utf-8")
+    runpy.run_path(str(SCRIPTS / "analyze_glm_moe_decode.py"), run_name="__main__")
+    fit = json.loads(Path("results/glm_moe_decode_fit.json").read_text())
     assert fit["slope_ms_per_token"] == pytest.approx(0.125)
     assert fit["intercept_ms"] == pytest.approx(2.0)
     assert fit["r_squared"] == pytest.approx(1.0)
-    assert fit["rmse_ms"] < 1e-12
-
-
-@pytest.mark.parametrize(
-    "data",
-    [
-        {"complete": False, "results": []},
-        {"complete": True, "results": [{"batch_size": 1, "avg_ms": 1}]},
-        {
-            "complete": True,
-            "results": [{"batch_size": 1, "avg_ms": 1}, {"batch_size": 1, "avg_ms": 2}],
-        },
-        {
-            "complete": True,
-            "results": [{"batch_size": 1, "avg_ms": 1}, {"batch_size": 2, "avg_ms": float("nan")}],
-        },
-    ],
-)
-def test_regression_rejects_incomplete_or_invalid_data(data):
+    assert Path("results/glm_moe_decode.png").read_bytes().startswith(b"\x89PNG")
+    data["complete"] = False
+    Path("results/glm_moe_decode.json").write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError):
-        analysis.fit_results(data)
-
-
-def test_constant_latency_has_undefined_r_squared():
-    _, fit = analysis.fit_results(
-        {
-            "complete": True,
-            "results": [
-                {"batch_size": 1, "avg_ms": 2.0},
-                {"batch_size": 128, "avg_ms": 2.0},
-            ],
-        }
-    )
-    assert fit["r_squared"] is None
-    assert fit["rmse_ms"] < 1e-12
-
-
-def test_linux_cpu_list():
-    assert bench.parse_cpu_list("0-3,8,10-11\n") == {0, 1, 2, 3, 8, 10, 11}
+        runpy.run_path(str(SCRIPTS / "analyze_glm_moe_decode.py"), run_name="__main__")
