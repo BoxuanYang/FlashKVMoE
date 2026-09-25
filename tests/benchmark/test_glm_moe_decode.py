@@ -16,6 +16,10 @@ def test_callback_times_only_synchronous_expert_forward():
     spec = importlib.util.spec_from_file_location("bench", SCRIPTS / "bench_glm_moe_decode.py")
     bench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bench)
+    assert bench.MODEL == "/data1/models/GLM-4.5-Air-GGUF"
+    assert bench.WEIGHT_PATH == "/data1/models/GLM-4.5-Air-GGUF/IQ4_XS"
+    assert bench.PHYSICAL_GPU == "2"
+    assert bench.AUTO_ANALYZE is True
     assert list(bench.BATCH_SIZES) == list(range(1, 129))
     assert bench.REPEATS == 20
     bench.experts = SimpleNamespace(forward=Mock())

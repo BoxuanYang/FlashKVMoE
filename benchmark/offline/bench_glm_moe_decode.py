@@ -3,14 +3,16 @@
 import ctypes
 import json
 import os
+import runpy
 import statistics
 import sys
 import time
 from pathlib import Path
 
-# 修改这里的参数，然后直接运行本文件。
-MODEL = "zai-org/GLM-4.5-Air"  # 也可以填写本地 config.json 所在目录
-WEIGHT_PATH = "/path/to/GLM-4.5-Air-GGUF"
+# 服务器上的实验参数。激活 minisgl-kt 环境后可直接运行本文件。
+MODEL = "/data1/models/GLM-4.5-Air-GGUF"
+WEIGHT_PATH = "/data1/models/GLM-4.5-Air-GGUF/IQ4_XS"
+PHYSICAL_GPU = "2"
 LAYER_INDEX = 7  # 从 0 开始，即 GGUF 的 blk.7
 BATCH_SIZES = range(1, 129)
 REPEATS = 20
@@ -20,6 +22,7 @@ NUMA_POOLS = 2  # KT 自动绑定到 NUMA 0/1，各 32 个工作线程
 DEVICE = "cuda:0"
 SEED = 42
 OUTPUT = Path("results/glm_moe_decode.json")
+AUTO_ANALYZE = True
 
 
 # 在回调内部计时，避免把 router、传输、graph launch 或回调排队算进去。
@@ -36,6 +39,8 @@ def timed_experts(_):
 
 
 if __name__ == "__main__":
+    # 必须在 import torch 之前设置。脚本中的 cuda:0 对应物理 GPU 2。
+    os.environ["CUDA_VISIBLE_DEVICES"] = PHYSICAL_GPU
     if sys.platform != "linux":
         raise RuntimeError("需要 Linux、CUDA 和本仓库的 KT LLAMAFILE 后端")
     if ctypes.CDLL("libnuma.so.1").numa_available() < 0:
@@ -210,3 +215,9 @@ if __name__ == "__main__":
                 f"batch_size={batch_size:3d}, routed experts={result['avg_ms']:.4f} ms", flush=True
             )
             graph.reset()  # 释放 graph 后，下一组才替换 CPU 缓冲区和 forward_args
+
+    print(f"\n测量完成：{OUTPUT}", flush=True)
+    if AUTO_ANALYZE:
+        print("开始画图和线性回归……", flush=True)
+        analysis = Path(__file__).with_name("analyze_glm_moe_decode.py")
+        runpy.run_path(str(analysis), run_name="__main__")

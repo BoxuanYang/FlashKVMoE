@@ -1,12 +1,15 @@
 # GLM-4.5-Air routed experts 耗时实验
 
-先修改 bench_glm_moe_decode.py 开头的 MODEL 和 WEIGHT_PATH。
+脚本已经配置好本机模型目录、IQ4_XS 权重目录和物理 GPU 2。
 需要 Linux、CUDA、本仓库及 pinned KT LLAMAFILE 环境。
 
 ```bash
+cd ~/FlashKVMoE
+conda activate minisgl-kt
 python benchmark/offline/bench_glm_moe_decode.py
-python benchmark/offline/analyze_glm_moe_decode.py
 ```
+
+这一条 Python 命令会完成测量、保存 JSON、画图和线性回归，无需传参数。
 
 所有参数都在文件开头。默认 batch size 为 **1–128 的全部整数**，共 128 组。
 每组预热 20 次，再正式测量 **20 次**，JSON 中的 avg_ms 是这 20 次的算术平均值。
