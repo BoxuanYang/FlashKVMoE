@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, Dict, NamedTuple, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Tuple
 
 import torch
 from minisgl.attention import create_attention_backend
@@ -10,6 +10,8 @@ from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, 
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model
+from minisgl.models.base import BaseLLMModel
+from minisgl.models.config import ModelConfig
 from minisgl.models.gguf import GGUFWeights
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
@@ -27,7 +29,11 @@ class ForwardOutput(NamedTuple):
 
 
 class Engine:
-    def __init__(self, config: EngineConfig):
+    def __init__(
+        self,
+        config: EngineConfig,
+        model_factory: Callable[[ModelConfig], BaseLLMModel] = create_model,
+    ):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
@@ -56,7 +62,7 @@ class Engine:
         # ======================= Model initialization ========================
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
-            self.model = create_model(config.model_config)
+            self.model = model_factory(config.model_config)
         assert config.kt_weight_path is not None
         gguf_weights = GGUFWeights(config.kt_weight_path, config.model_config)
         from minisgl.moe.ktransformers import load_ktransformers_experts
