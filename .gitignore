@@ -10,6 +10,7 @@ __pycache__/
 # json files
 *.json
 *.jsonl
+!evaluation/OSC/data.json
 
 # profiling data
 *.nsys-rep
