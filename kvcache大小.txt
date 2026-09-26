@@ -1,0 +1,31 @@
+GLM-4.5-Air 的 KV Cache 大小
+=============================
+
+结论（默认 BF16）：188,416 bytes/token = 184 KiB/token。
+
+官方配置（zai-org/GLM-4.5-Air/config.json）：
+- Transformer 层数：46
+- KV heads：8
+- head_dim：128
+- 默认 dtype：bfloat16（2 bytes/元素）
+
+计算：
+KV Cache bytes/token
+= K 和 V × 层数 × KV heads × head_dim × 每元素字节数
+= 2 × 46 × 8 × 128 × 2
+= 188,416 bytes/token
+= 184 KiB/token
+
+因此，单条序列在 BF16 KV Cache 下：
+- 1,024 tokens：188 MiB
+- 131,072 tokens（128K）：23 GiB
+
+若显式使用 FP8/INT8 KV Cache（1 byte/元素），则为：
+94,208 bytes/token = 92 KiB/token；128K 上下文为 11.5 GiB。
+
+说明：
+- 这是整个模型、单条序列、不计分页对齐和运行时元数据的理论 KV 数据量。
+- batch 中各序列占用相加；Tensor Parallel 可能把缓存分摊到多张卡，但总量不变。
+- 模型权重采用 4-bit/FP8 量化，并不代表 KV Cache 自动采用同样精度；KV dtype 取决于推理框架配置。
+
+来源：https://huggingface.co/zai-org/GLM-4.5-Air/blob/main/config.json
