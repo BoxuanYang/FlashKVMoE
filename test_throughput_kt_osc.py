@@ -31,6 +31,10 @@ KT_WEIGHT_PATH = "/data1/models/GLM-4.5-Air-GGUF/IQ4_XS"
 CUDA_DEVICE = "6"
 KT_CPU_THREADS = 64
 
+# 40,000 KV tokens / about 426 tokens per OSC request = about 94 concurrent requests.
+MAX_RUNNING_REQUESTS = 96
+CUDA_GRAPH_MAX_BS = 96
+
 REQUEST_RATES = [0.5, 1, 1.5, 2, 2.5, 3]
 REQUESTS_PER_RATE = 600
 OUTPUT_TOKENS = 128
@@ -68,7 +72,7 @@ def server_command() -> list[str]:
         "--attention-backend",
         "fi",
         "--cuda-graph-max-bs",
-        "5",
+        str(CUDA_GRAPH_MAX_BS),
         "--page-size",
         "2",
         "--num-pages",
@@ -78,7 +82,7 @@ def server_command() -> list[str]:
         "--max-prefill-length",
         "7000",
         "--max-running-requests",
-        "5",
+        str(MAX_RUNNING_REQUESTS),
     ]
 
 
