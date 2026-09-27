@@ -1,6 +1,7 @@
 """Measure GLM-4.5-Air decode attention with CUDA Graph."""
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "6")
 
@@ -8,7 +9,8 @@ import torch
 from flashinfer import single_decode_with_kv_cache
 
 DEVICE = torch.device("cuda:0")
-SEQUENCE_LENGTHS = [2 * i for i in range(1, 80)]
+SEQUENCE_LENGTHS = [2000 * i for i in range(1, 80)]
+OUTPUT_PATH = Path("gpu_perf.txt")
 
 QUERY_HEADS = 96
 KV_HEADS = 8
@@ -84,18 +86,29 @@ def main():
         graph, output = capture_graph(query, keys, values)
         results.append((sequence_length, measure_gpu_ms(graph)))
 
-        # Keep the captured output alive until all graph replays have finished.
-        _ = output
+        # Captured tensors stay alive until every replay has finished.
         graph.reset()
+        del graph, output, query, keys, values
+        torch.cuda.empty_cache()
 
-    print("GLM-4.5-Air decode attention")
-    print(f"GPU: {gpu_name}")
-    print(f"Batch size: 1, CUDA Graph: on, repeats: {REPEATS}")
-    print("Timing uses CUDA Events and covers attention only.\n")
-    print(f"{'Sequence':>10} {'GPU ms':>14}")
-    print("-" * 25)
-    for sequence_length, gpu_ms in results:
-        print(f"{sequence_length:>10} {gpu_ms:>14.6f}")
+    lines = [
+        "GLM-4.5-Air decode attention",
+        f"GPU: {gpu_name}",
+        f"Batch size: 1, CUDA Graph: on, repeats: {REPEATS}",
+        "Timing uses CUDA Events and covers attention only.",
+        "",
+        f"{'Sequence':>10} {'GPU ms':>14}",
+        "-" * 25,
+    ]
+    lines.extend(
+        f"{sequence_length:>10} {gpu_ms:>14.6f}"
+        for sequence_length, gpu_ms in results
+    )
+
+    report = "\n".join(lines) + "\n"
+    OUTPUT_PATH.write_text(report, encoding="utf-8")
+    print("\n" + report, end="")
+    print(f"Results written to {OUTPUT_PATH.resolve()}")
 
 
 if __name__ == "__main__":
