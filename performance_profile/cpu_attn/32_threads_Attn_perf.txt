@@ -1,0 +1,12 @@
+GLM-4.5-Air layer 8 decode attention
+GPU: NVIDIA RTX A6000
+CPU threads: 32, NUMA pools: 2, repeats: 10
+Unit: ms; batch size: 1
+Timing excludes QKV projection, RoPE, weight loading and data transfers.
+
+  Sequence            CPU    GPU with CUDA Graph   GPU without CUDA Graph
+-------------------------------------------------------------------------
+       200         0.1077                 0.0079                   0.0414
+       500         0.1078                 0.0103                   0.0446
+      1000         0.1328                 0.0106                   0.0451
+      2048         0.1236                 0.0204                   0.0440
