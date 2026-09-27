@@ -3,6 +3,7 @@
 import os
 import sys
 import time
+from pathlib import Path
 
 # Keep the script directly runnable on the same GPU used by the MiniSGL command.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "6")
@@ -35,6 +36,7 @@ NUMA_POOLS = 2
 BLOCK_LENGTH = 128
 DEVICE = torch.device("cuda:0")
 SEED = 42
+OUTPUT_PATH = Path("Attn_perf.txt")
 
 
 def pack_weight(checkpoint: GGUFWeights, name: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -252,11 +254,8 @@ def main():
     cpu_infer, pool = make_cpu_pool()  # Keep cpu_infer alive while pool is in use.
     _ = cpu_infer
 
-    print(f"GPU: {torch.cuda.get_device_name(DEVICE)}")
-    print(f"CPU threads: {CPU_THREADS}, NUMA pools: {NUMA_POOLS}, repeats: {REPEATS}")
-    print("Times cover attention only; QKV projection, RoPE and transfers are excluded.\n")
-    print(f"{'CUDA graph':<12} {'sequence':>10} {'GPU ms':>12} {'CPU ms':>12}")
-    print("-" * 50)
+    gpu_name = torch.cuda.get_device_name(DEVICE)
+    results = []
 
     for sequence_length in SEQUENCE_LENGTHS:
         query, keys, values = make_inputs(layer, model_config, sequence_length)
@@ -264,29 +263,50 @@ def main():
             query, keys, values, sequence_length, pool
         )
 
-        for use_graph in (False, True):
-            if use_graph:
-                graph, gpu_output = capture_gpu_graph(query, keys, values)
-                gpu_operation = graph.replay
-            else:
-                graph = None
-                gpu_output = gpu_attention(query, keys, values)
-                gpu_operation = lambda: gpu_attention(query, keys, values)
+        gpu_output = gpu_attention(query, keys, values)
+        gpu_without_graph_ms = average_ms(
+            lambda: gpu_attention(query, keys, values), torch.cuda.synchronize
+        )
 
-            gpu_ms = average_ms(gpu_operation, torch.cuda.synchronize)
-            cpu_ms = average_ms(cpu_attention)
-            cpu_attention()
+        graph, graph_output = capture_gpu_graph(query, keys, values)
+        gpu_with_graph_ms = average_ms(graph.replay, torch.cuda.synchronize)
+        cpu_ms = average_ms(cpu_attention)
+        cpu_attention()
+
+        for expected in (gpu_output, graph_output):
             torch.testing.assert_close(
                 cpu_output.float(),
-                gpu_output.unsqueeze(0).cpu().float(),
+                expected.unsqueeze(0).cpu().float(),
                 rtol=0.03,
                 atol=0.03,
             )
 
-            graph_name = "on" if use_graph else "off"
-            print(f"{graph_name:<12} {sequence_length:>10} {gpu_ms:>12.4f} {cpu_ms:>12.4f}")
-            if graph is not None:
-                graph.reset()
+        results.append(
+            (sequence_length, cpu_ms, gpu_with_graph_ms, gpu_without_graph_ms)
+        )
+        graph.reset()
+
+    lines = [
+        "GLM-4.5-Air layer 8 decode attention",
+        f"GPU: {gpu_name}",
+        f"CPU threads: {CPU_THREADS}, NUMA pools: {NUMA_POOLS}, repeats: {REPEATS}",
+        "Unit: ms; batch size: 1",
+        "Timing excludes QKV projection, RoPE, weight loading and data transfers.",
+        "",
+        (
+            f"{'Sequence':>10} {'CPU':>14} "
+            f"{'GPU with CUDA Graph':>22} {'GPU without CUDA Graph':>24}"
+        ),
+        "-" * 73,
+    ]
+    lines.extend(
+        f"{length:>10} {cpu_ms:>14.4f} {gpu_graph_ms:>22.4f} {gpu_ms:>24.4f}"
+        for length, cpu_ms, gpu_graph_ms, gpu_ms in results
+    )
+    report = "\n".join(lines) + "\n"
+    OUTPUT_PATH.write_text(report, encoding="utf-8")
+    print("\n" + report, end="")
+    print(f"Results written to {OUTPUT_PATH.resolve()}")
 
 
 if __name__ == "__main__":
