@@ -1,4 +1,4 @@
-"""Measure the GLM GPU overlap path at a fixed total KV length."""
+"""Measure the GLM GPU overlap path at 64K total KV and one short baseline."""
 
 import os
 from dataclasses import replace
@@ -29,22 +29,23 @@ from test_gpu_single_attn_perf import (
 )
 from transformers import AutoConfig
 
-TOTAL_CONTEXT = 128 * 1024
+TOTAL_CONTEXT = 64 * 1024
+SHORT_SEQUENCE_CONFIG = (1, 10)
 CONFIGS = [
-    (1, 128 * 1024),
-    (2, 64 * 1024),
-    (4, 32 * 1024),
-    (8, 16 * 1024),
-    (16, 8 * 1024),
-    (32, 4 * 1024),
-    (64, 2 * 1024)
+    (1, 64 * 1024),
+    (2, 32 * 1024),
+    (4, 16 * 1024),
+    (8, 8 * 1024),
+    (16, 4 * 1024),
+    (32, 2 * 1024),
+    (64, 1 * 1024),
 ]
 OUTPUT_PATH = Path(__file__).with_name("multiconcurrency.txt")
 SEED = 42
 
 
 def initialize_kv_cache(context: Context, config: ModelConfig):
-    """Allocate exactly 128K KV slots for layer 7."""
+    """Allocate 64K KV slots for layer 7."""
     num_pages = (TOTAL_CONTEXT + PAGE_SIZE - 1) // PAGE_SIZE
     context.kv_cache = MHAKVCache(
         num_kv_heads=config.num_kv_heads,
@@ -67,8 +68,10 @@ def make_inputs(config: ModelConfig, batch_size: int):
 
 
 def make_decode_batch(context: Context, batch_size: int, sequence_length: int):
-    """Give every request its own contiguous section of the 128K KV cache."""
-    assert batch_size * sequence_length == TOTAL_CONTEXT
+    """Give every request its own contiguous section of the KV cache."""
+    total_context = batch_size * sequence_length
+    if total_context > TOTAL_CONTEXT:
+        raise ValueError(f"Total context {total_context} exceeds {TOTAL_CONTEXT}")
 
     requests = [
         Req(
@@ -94,7 +97,7 @@ def make_decode_batch(context: Context, batch_size: int, sequence_length: int):
         - 1
     )
     context.page_table = torch.arange(
-        TOTAL_CONTEXT, device=DEVICE, dtype=torch.int32
+        total_context, device=DEVICE, dtype=torch.int32
     ).view(batch_size, sequence_length)
     return batch
 
@@ -113,6 +116,8 @@ def main():
     context = Context(page_size=PAGE_SIZE)
     set_global_ctx(context)
     config = ModelConfig.from_hf(AutoConfig.from_pretrained(MODEL_PATH))
+    if any(batch * sequence != TOTAL_CONTEXT for batch, sequence in CONFIGS):
+        raise ValueError("Every multiconcurrency configuration must total 64K tokens")
     if config.rotary_config.max_position < TOTAL_CONTEXT:
         config = replace(
             config,
@@ -134,7 +139,7 @@ def main():
     gpu_name = torch.cuda.get_device_name(DEVICE)
     results = []
 
-    for batch_size, sequence_length in CONFIGS:
+    for batch_size, sequence_length in [SHORT_SEQUENCE_CONFIG, *CONFIGS]:
         hidden, residual = make_inputs(config, batch_size)
         batch = make_decode_batch(context, batch_size, sequence_length)
         backend = FlashInferBackend(config)
@@ -148,7 +153,8 @@ def main():
         with context.forward_batch(batch):
             graph, output = capture_graph(operation)
             latency_ms = measure_gpu_ms(graph)
-        results.append((batch_size, sequence_length, latency_ms))
+        total_context = batch_size * sequence_length
+        results.append((batch_size, sequence_length, total_context, latency_ms))
         print(
             f"batch={batch_size:>2}, seq/request={sequence_length:>6}: "
             f"{latency_ms:.6f} ms",
@@ -160,17 +166,24 @@ def main():
         del graph, output, operation, hidden, residual, batch, backend
         torch.cuda.empty_cache()
 
+    baseline = results[0]
+    multiconcurrency_results = results[1:]
     lines = [
         f"GLM-4.5-Air layer {LAYER_NUMBER} GPU overlap path",
         f"GPU: {gpu_name}",
         f"CUDA Graph: on, warmup: {WARMUP}, repeats: {REPEATS}",
         "Includes norms, attention, shared expert and MoE router; excludes routed experts.",
         "",
+        "## Short-sequence baseline",
+        "## Batch   Seq/request   Total KV   GPU Attention (ms)",
+        f"{baseline[0]:>8} {baseline[1]:>13} {baseline[2]:>10} {baseline[3]:>20.6f}",
+        "",
+        "## Fixed 64K total context",
         "## Batch   Seq/request   Total KV   GPU Attention (ms)",
     ]
     lines.extend(
-        f"{batch_size:>8} {sequence_length:>13} {TOTAL_CONTEXT:>10} {latency_ms:>20.6f}"
-        for batch_size, sequence_length, latency_ms in results
+        f"{batch_size:>8} {sequence_length:>13} {total_context:>10} {latency_ms:>20.6f}"
+        for batch_size, sequence_length, total_context, latency_ms in multiconcurrency_results
     )
     report = "\n".join(lines) + "\n"
     OUTPUT_PATH.write_text(report, encoding="utf-8")
