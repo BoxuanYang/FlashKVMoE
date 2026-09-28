@@ -8,13 +8,15 @@ from pathlib import Path
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "6")
 
 import torch
-from flashinfer import single_decode_with_kv_cache
+import torch.nn.functional as F
+from minisgl.attention.fi import FlashInferBackend
+from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import set_tp_info
-from minisgl.layers import set_rope_device
-from minisgl.layers.marlin import pack_marlin
+from minisgl.kvcache.mha_pool import MHAKVCache
+from minisgl.layers import AttentionLayer, BaseOP, RMSNormFused, set_rope_device
+from minisgl.layers.marlin import MarlinLinear, pack_marlin
 from minisgl.models.config import ModelConfig
 from minisgl.models.gguf import GGUFWeights
-from minisgl.models.glm4_moe import Glm4MoeDecoderLayer
 from minisgl.utils import torch_dtype
 from transformers import AutoConfig
 
@@ -26,10 +28,94 @@ LAYER_INDEX = LAYER_NUMBER - 1  # Human layer 7 is GGUF blk.6.
 DEVICE = torch.device("cuda:0")
 SEQUENCE_LENGTHS = [2000 * i for i in range(1, 80)]
 OUTPUT_PATH = Path("gpu_perf.txt")
+PAGE_SIZE = 2
 
 WARMUP = 10
 REPEATS = 100
 SEED = 42
+
+
+class Glm4MoeMLP(BaseOP):
+    def __init__(self, hidden: int, intermediate: int):
+        self.gate_up_proj = MarlinLinear(hidden, 2 * intermediate)
+        self.down_proj = MarlinLinear(intermediate, hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up_proj.forward(x).chunk(2, dim=-1)
+        return self.down_proj.forward(F.silu(gate) * up)
+
+
+class Glm4MoeRouter(BaseOP):
+    def __init__(self, config: ModelConfig):
+        self.weight = torch.empty(config.num_experts, config.hidden_size, dtype=torch.float32)
+        self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
+        self._config = config
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        c = self._config
+        scores = F.linear(x.float(), self.weight).sigmoid()
+        choice = scores + self.e_score_correction_bias
+        grouped = choice.view(-1, c.n_group, c.num_experts // c.n_group)
+        groups = grouped.topk(2, dim=-1).values.sum(-1).topk(c.topk_group, dim=-1).indices
+        mask = torch.zeros_like(grouped[..., 0], dtype=torch.bool).scatter_(1, groups, True)
+        choice = grouped.masked_fill(~mask.unsqueeze(-1), 0).flatten(1)
+        ids = choice.topk(c.num_experts_per_tok, dim=-1, sorted=False).indices
+        weights = scores.gather(1, ids)
+        if c.norm_topk_prob:
+            weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+        return ids, weights * c.routed_scaling_factor
+
+
+class Glm4MoeSparseMLP(BaseOP):
+    def __init__(self, config: ModelConfig):
+        self.gate = Glm4MoeRouter(config)
+        self.shared_experts = Glm4MoeMLP(
+            config.hidden_size, config.n_shared_experts * config.moe_intermediate_size
+        )
+        self._wrapper = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ids, weights = self.gate.forward(x)
+        routed = self._wrapper.forward(
+            x, ids, weights, torch.cuda.current_stream(x.device).cuda_stream
+        )
+        return routed + self.shared_experts.forward(x)
+
+
+class Glm4MoeAttention(BaseOP):
+    def __init__(self, config: ModelConfig, layer_id: int):
+        qkv = (config.num_qo_heads + 2 * config.num_kv_heads) * config.head_dim
+        self.qkv_proj = MarlinLinear(config.hidden_size, qkv)
+        self.qkv_bias = torch.empty(qkv)
+        self.attn = AttentionLayer(
+            layer_id,
+            config.num_qo_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.rotary_config,
+        )
+        self.o_proj = MarlinLinear(config.num_qo_heads * config.head_dim, config.hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.o_proj.forward(self.attn.forward(self.qkv_proj.forward(x) + self.qkv_bias))
+
+
+class Glm4MoeDecoderLayer(BaseOP):
+    def __init__(self, config: ModelConfig, layer_id: int):
+        self.self_attn = Glm4MoeAttention(config, layer_id)
+        self.mlp = (
+            Glm4MoeMLP(config.hidden_size, config.intermediate_size)
+            if layer_id < config.first_k_dense_replace
+            else Glm4MoeSparseMLP(config)
+        )
+        self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor | None):
+        x, residual = self.input_layernorm.forward(x, residual)
+        x = self.self_attn.forward(x)
+        x, residual = self.post_attention_layernorm.forward(x, residual)
+        return self.mlp.forward(x), residual
 
 
 def pack_weight(checkpoint: GGUFWeights, name: str):
@@ -114,43 +200,68 @@ def load_decoder_layer(config: ModelConfig) -> Glm4MoeDecoderLayer:
     return layer
 
 
-def make_inputs(config: ModelConfig, sequence_length: int):
-    """Create one decode token, its residual, position, and KV history."""
+def initialize_kv_cache(context: Context, config: ModelConfig, max_length: int):
+    """Create the same paged MHA cache used by the production backend."""
+    num_pages = (max_length + PAGE_SIZE - 1) // PAGE_SIZE
+    context.kv_cache = MHAKVCache(
+        num_kv_heads=config.num_kv_heads,
+        num_layers=LAYER_INDEX + 1,
+        head_dim=config.head_dim,
+        num_pages=num_pages,
+        page_size=PAGE_SIZE,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    context.kv_cache.k_cache(LAYER_INDEX).zero_()
+    context.kv_cache.v_cache(LAYER_INDEX).zero_()
+    context.page_table = torch.arange(max_length, device=DEVICE, dtype=torch.int32).view(1, -1)
+
+
+def make_inputs(config: ModelConfig):
+    """Create the activation and residual entering decoder layer 7."""
     hidden = torch.randn(1, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
     residual = torch.randn_like(hidden)
-    position = torch.tensor([sequence_length - 1], device=DEVICE, dtype=torch.int32)
-    kv_shape = (sequence_length, config.num_kv_heads, config.head_dim)
-    keys = torch.randn(kv_shape, device=DEVICE, dtype=torch.bfloat16)
-    values = torch.randn(kv_shape, device=DEVICE, dtype=torch.bfloat16)
-    return hidden, residual, position, keys, values
+    return hidden, residual
 
 
-def gpu_work(layer, config, hidden, residual, position, keys, values):
-    """Run every GPU operation before and alongside the CPU routed experts."""
+def gpu_overlap_path(
+    layer: Glm4MoeDecoderLayer,
+    hidden: torch.Tensor,
+    residual: torch.Tensor,
+):
+    """Run the original layer's GPU work, excluding only routed CPU experts."""
     hidden, residual = layer.input_layernorm.forward(hidden, residual)
-
-    qkv = layer.self_attn.qkv_proj.forward(hidden) + layer.self_attn.qkv_bias
-    query_size = config.num_qo_heads * config.head_dim
-    kv_size = config.num_kv_heads * config.head_dim
-    query, current_key, current_value = qkv.split([query_size, kv_size, kv_size], dim=-1)
-    query, current_key = layer.self_attn.attn.rotary.forward(position, query, current_key)
-
-    keys[-1].copy_(current_key.view(config.num_kv_heads, config.head_dim))
-    values[-1].copy_(current_value.view(config.num_kv_heads, config.head_dim))
-    attention = single_decode_with_kv_cache(
-        query.view(config.num_qo_heads, config.head_dim),
-        keys,
-        values,
-        kv_layout="NHD",
-        pos_encoding_mode="NONE",
-        use_tensor_cores=True,
-    )
-    hidden = layer.self_attn.o_proj.forward(attention.reshape(1, -1))
+    hidden = layer.self_attn.forward(hidden)
     hidden, residual = layer.post_attention_layernorm.forward(hidden, residual)
 
+    if not isinstance(layer.mlp, Glm4MoeSparseMLP):
+        raise TypeError("The GPU overlap benchmark requires a sparse MoE layer")
     expert_ids, expert_weights = layer.mlp.gate.forward(hidden)
     shared_output = layer.mlp.shared_experts.forward(hidden)
     return shared_output, expert_ids, expert_weights, residual
+
+
+def make_decode_batch(sequence_length: int) -> Batch:
+    """Build a real batch with one decode token and a synthetic history."""
+    request = Req(
+        input_ids=torch.zeros(sequence_length, dtype=torch.int32),
+        table_idx=0,
+        cached_len=sequence_length - 1,
+        output_len=1,
+        uid=0,
+        sampling_params=None,  # type: ignore[arg-type]
+        cache_handle=None,  # type: ignore[arg-type]
+    )
+    batch = Batch([request], "decode")
+    batch.padded_reqs = batch.reqs
+    batch.input_ids = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+    batch.positions = torch.tensor(
+        [sequence_length - 1], device=DEVICE, dtype=torch.int32
+    )
+    batch.out_loc = torch.tensor(
+        [sequence_length - 1], device=DEVICE, dtype=torch.int32
+    )
+    return batch
 
 
 def capture_graph(operation):
@@ -191,6 +302,8 @@ def main():
     torch.cuda.set_device(DEVICE)
     set_tp_info(0, 1)
     set_rope_device(DEVICE)
+    context = Context(page_size=PAGE_SIZE)
+    set_global_ctx(context)
 
     config = ModelConfig.from_hf(AutoConfig.from_pretrained(MODEL_PATH))
     max_length = max(SEQUENCE_LENGTHS)
@@ -209,17 +322,25 @@ def main():
 
     print(f"Loading GLM-4.5-Air layer {LAYER_NUMBER} GPU weights ...", flush=True)
     layer = load_decoder_layer(config)
+    initialize_kv_cache(context, config, max_length)
     gpu_name = torch.cuda.get_device_name(DEVICE)
     results = []
 
     for sequence_length in SEQUENCE_LENGTHS:
-        inputs = make_inputs(config, sequence_length)
-        operation = partial(gpu_work, layer, config, *inputs)
-        graph, output = capture_graph(operation)
-        results.append((sequence_length, measure_gpu_ms(graph)))
+        hidden, residual = make_inputs(config)
+        batch = make_decode_batch(sequence_length)
+        backend = FlashInferBackend(config)
+        context.attn_backend = backend
+        backend.init_capture_graph(max_seq_len=max_length, bs_list=[1])
+        backend.prepare_for_capture(batch)
+        operation = partial(gpu_overlap_path, layer, hidden, residual)
+        with context.forward_batch(batch):
+            graph, output = capture_graph(operation)
+            results.append((sequence_length, measure_gpu_ms(graph)))
 
         graph.reset()
-        del graph, output, operation, inputs
+        del context.attn_backend
+        del graph, output, operation, hidden, residual, batch, backend
         torch.cuda.empty_cache()
 
     lines = [
