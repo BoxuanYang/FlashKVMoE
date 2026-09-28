@@ -20,7 +20,7 @@ BATCH_SIZES = range(1, 257)
 CPU_THREADS = 64
 THREAD_POOL_COUNT = 2
 WARMUP = 3
-REPEATS = 10
+REPEATS = 40
 SEED = 42
 
 DEVICE = torch.device("cuda:0")

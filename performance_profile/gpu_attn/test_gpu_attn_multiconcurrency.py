@@ -14,7 +14,7 @@ from minisgl.distributed import set_tp_info
 from minisgl.kvcache.mha_pool import MHAKVCache
 from minisgl.layers import set_rope_device
 from minisgl.models.config import ModelConfig
-from test_gpu_attn_perf import (
+from test_gpu_single_attn_perf import (
     DEVICE,
     LAYER_INDEX,
     LAYER_NUMBER,
@@ -37,7 +37,7 @@ CONFIGS = [
     (8, 16 * 1024),
     (16, 8 * 1024),
     (32, 4 * 1024),
-    (64, 2 * 1024),
+    (64, 2 * 1024)
 ]
 OUTPUT_PATH = Path(__file__).with_name("multiconcurrency.txt")
 SEED = 42

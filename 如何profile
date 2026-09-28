@@ -14,11 +14,11 @@ nsys launch \
   python -u -m minisgl \
     --host 127.0.0.1 \
     --port 30000 \
-    --model /data1/models/Qwen3-235B-A22B-GGUF/IQ4_XS \
+    --model /data1/models/GLM-4.5-Air-GGUF \
     --dtype bfloat16 \
     --tp-size 1 \
     --moe-backend kt \
-    --kt-weight-path /data1/models/Qwen3-235B-A22B-GGUF/IQ4_XS \
+    --kt-weight-path /data1/models/GLM-4.5-Air-GGUF/IQ4_XS \
     --kt-cpuinfer 64 \
     --kt-threadpool-count 2 \
     --kt-method LLAMAFILE \
@@ -28,14 +28,14 @@ nsys launch \
     --num-pages 20000 \
     --max-seq-len-override 7000 \
     --max-prefill-length 7000 \
-    --max-running-requests 5
+    --max-running-requests 200
 等待出现：
 API server is ready to serve on 127.0.0.1:30000
 终端 2：预热
 curl -sS http://127.0.0.1:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "/data1/models/Qwen3-235B-A22B-GGUF/IQ4_XS",
+    "model": "/data1/models/GLM-4.5-Air-GGUF",
     "messages": [{"role": "user", "content": "Hello"}],
     "temperature": 0,
     "max_tokens": 16,

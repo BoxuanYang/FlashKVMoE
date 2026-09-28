@@ -1,0 +1,13 @@
+GLM-4.5-Air layer 7 GPU overlap path
+GPU: NVIDIA RTX A6000
+CUDA Graph: on, warmup: 10, repeats: 100
+Includes norms, attention, shared expert and MoE router; excludes routed experts.
+
+## Batch   Seq/request   Total KV   GPU Attention (ms)
+       1        131072     131072             0.938650
+       2         65536     131072             0.954327
+       4         32768     131072             0.945336
+       8         16384     131072             0.949422
+      16          8192     131072             0.949565
+      32          4096     131072             0.978913
+      64          2048     131072             1.052959
