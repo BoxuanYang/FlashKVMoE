@@ -102,24 +102,46 @@ def measure_ms(wrapper, hidden_states, expert_ids, expert_weights, stream) -> fl
         )
         current_slot = wrapper.layer_idx % KExpertsCPUBuffer.buffer_depth
         output_cpu = buffers[4][current_slot]
+        reference_cpu = output_cpu.clone()
+        reference_nonfinite = torch.count_nonzero(~torch.isfinite(reference_cpu)).item()
+        if reference_nonfinite:
+            raise RuntimeError(
+                "Eager KT CPU MoE produced "
+                f"{reference_nonfinite}/{reference_cpu.numel()} non-finite values before graph replay"
+            )
+        if torch.count_nonzero(reference_cpu).item() == 0:
+            raise RuntimeError("Eager KT CPU MoE produced an all-zero reference output")
 
-        for _ in range(WARMUP):
-            # If the CPU host callback does not run, NaNs remain in the buffer.
-            output_cpu.fill_(float("nan"))
+        def verify_fresh_output(phase: str):
+            nonzero = torch.count_nonzero(output_cpu).item()
+            if nonzero == 0:
+                raise RuntimeError(
+                    f"CUDA Graph {phase} left the cleared CPU output unchanged; "
+                    "the KT submit host callback did not produce a result"
+                )
+            try:
+                torch.testing.assert_close(output_cpu, reference_cpu, rtol=1e-3, atol=1e-3)
+            except AssertionError as error:
+                raise RuntimeError(
+                    f"CUDA Graph {phase} CPU output differs from the eager KT reference"
+                ) from error
+
+        for warmup_index in range(WARMUP):
+            # A finite sentinel avoids contaminating implementations that read
+            # the destination while still detecting a skipped CPU callback.
+            output_cpu.zero_()
             graph.replay()
             stream.synchronize()
-            if not torch.isfinite(output_cpu).all().item():
-                raise RuntimeError("CUDA Graph replay reused a stale CPU MoE output")
+            verify_fresh_output(f"warmup {warmup_index + 1}")
 
         samples_ms = []
-        for _ in range(REPEATS):
-            output_cpu.fill_(float("nan"))
+        for repeat_index in range(REPEATS):
+            output_cpu.zero_()
             start = time.perf_counter()
             graph.replay()
             stream.synchronize()
             samples_ms.append((time.perf_counter() - start) * 1000)
-            if not torch.isfinite(output_cpu).all().item():
-                raise RuntimeError("CUDA Graph replay reused a stale CPU MoE output")
+            verify_fresh_output(f"measurement {repeat_index + 1}")
 
         latency_ms = statistics.mean(samples_ms)
 
@@ -139,7 +161,7 @@ def save_results(gpu_name: str, results: list[tuple[int, float]]):
         "Excluded: shared expert, router, and all input D2H copies.",
         "Hidden states, expert IDs, and expert weights are copied to KT pinned CPU buffers before capture/timing.",
         "Timer: perf_counter around one graph replay plus stream.synchronize.",
-        "Every replay poisons/checks the CPU output to reject stale-result reuse.",
+        "Every replay clears and checks the CPU output against an eager reference.",
         "Expert IDs are random and unique per token.",
         "",
         f"{'Batch size':>10} {'MoE ms':>14}",
