@@ -1,6 +1,7 @@
 """Measure one GLM-4.5-Air routed MoE layer with KTransformers."""
 
 import os
+import statistics
 import time
 from pathlib import Path
 
@@ -56,50 +57,71 @@ def make_inputs(config: ModelConfig, batch_size: int):
     hidden_states = one_token.expand(batch_size, -1).contiguous()
 
     random_scores = torch.rand(batch_size, config.num_experts, device=DEVICE)
-    expert_ids = random_scores.topk(
-        config.num_experts_per_tok, dim=-1, sorted=False
-    ).indices
-    expert_weights = torch.rand(
-        batch_size, config.num_experts_per_tok, device=DEVICE
-    )
+    expert_ids = random_scores.topk(config.num_experts_per_tok, dim=-1, sorted=False).indices
+    expert_weights = torch.rand(batch_size, config.num_experts_per_tok, device=DEVICE)
     expert_weights /= expert_weights.sum(dim=-1, keepdim=True)
     return hidden_states, expert_ids, expert_weights
 
 
 def measure_ms(wrapper, hidden_states, expert_ids, expert_weights, stream) -> float:
-    """Capture one KT MoE forward and time graph replays end to end."""
+    """Time KT submit, CPU routed experts, sync, and output H2D."""
     from kt_kernel import KTMoEWrapper
+    from kt_kernel.experts_base import KExpertsCPUBuffer
 
     KTMoEWrapper.clear_buffer_cache()
     KTMoEWrapper.set_capture_batch_sizes([len(hidden_states)])
 
-    def forward():
-        return wrapper.forward(
-            hidden_states,
-            expert_ids,
-            expert_weights,
-            torch.cuda.current_stream(DEVICE).cuda_stream,
-        )
+    def stage_inputs():
+        # This is the only input D2H path. Complete it before capture/timing.
+        wrapper.copy_inputs_to_cpu_buffers(hidden_states, expert_ids, expert_weights)
+        stream.synchronize()
+
+    def forward_from_pinned_buffers():
+        # Current kt_kernel API: enqueue CPU MoE, enqueue its synchronization,
+        # then copy the completed pinned CPU output back to CUDA.
+        wrapper.forward_on_pinned_buffers(hidden_states, stream.cuda_stream)
+        return wrapper.sync_forward(hidden_states, stream.cuda_stream)
 
     stream.wait_stream(torch.cuda.current_stream(DEVICE))
     with torch.cuda.stream(stream):
+        stage_inputs()
         for _ in range(WARMUP):
-            forward()
+            forward_from_pinned_buffers()
         stream.synchronize()
 
+        # Re-stage explicitly before capture. The captured graph therefore has
+        # no hidden-state, expert-ID, or expert-weight D2H operation.
+        stage_inputs()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            output = forward()
+            output = forward_from_pinned_buffers()
+
+        buffers = KExpertsCPUBuffer.get_buffer(
+            hidden_states.view(-1, hidden_states.shape[-1]),
+            wrapper.num_experts_per_tok,
+        )
+        current_slot = wrapper.layer_idx % KExpertsCPUBuffer.buffer_depth
+        output_cpu = buffers[4][current_slot]
 
         for _ in range(WARMUP):
+            # If the CPU host callback does not run, NaNs remain in the buffer.
+            output_cpu.fill_(float("nan"))
             graph.replay()
-        stream.synchronize()
+            stream.synchronize()
+            if not torch.isfinite(output_cpu).all().item():
+                raise RuntimeError("CUDA Graph replay reused a stale CPU MoE output")
 
-        start = time.perf_counter()
+        samples_ms = []
         for _ in range(REPEATS):
+            output_cpu.fill_(float("nan"))
+            start = time.perf_counter()
             graph.replay()
-        stream.synchronize()
-        latency_ms = (time.perf_counter() - start) * 1000 / REPEATS
+            stream.synchronize()
+            samples_ms.append((time.perf_counter() - start) * 1000)
+            if not torch.isfinite(output_cpu).all().item():
+                raise RuntimeError("CUDA Graph replay reused a stale CPU MoE output")
+
+        latency_ms = statistics.mean(samples_ms)
 
     graph.reset()
     del graph, output
@@ -112,9 +134,13 @@ def save_results(gpu_name: str, results: list[tuple[int, float]]):
         f"GLM-4.5-Air layer {LAYER_NUMBER} routed MoE",
         f"GPU: {gpu_name}",
         f"KTransformers: {CPU_THREADS} CPU threads, {THREAD_POOL_COUNT} thread pools",
-        f"CUDA Graph: on, repeats: {REPEATS}",
-        "Includes GPU-to-CPU copy, CPU routed experts and CPU-to-GPU copy.",
-        "Router is excluded; expert IDs are random and unique per token.",
+        f"CUDA Graph: on, warmup: {WARMUP}, repeats: {REPEATS}",
+        "Timed: KT task submit/sync, CPU routed experts, and routed output H2D.",
+        "Excluded: shared expert, router, and all input D2H copies.",
+        "Hidden states, expert IDs, and expert weights are copied to KT pinned CPU buffers before capture/timing.",
+        "Timer: perf_counter around one graph replay plus stream.synchronize.",
+        "Every replay poisons/checks the CPU output to reject stale-result reuse.",
+        "Expert IDs are random and unique per token.",
         "",
         f"{'Batch size':>10} {'MoE ms':>14}",
         "-" * 25,
