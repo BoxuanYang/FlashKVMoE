@@ -76,25 +76,14 @@ def measure_ms(wrapper, hidden_states, expert_ids, expert_weights, stream) -> fl
         wrapper.copy_inputs_to_cpu_buffers(hidden_states, expert_ids, expert_weights)
         stream.synchronize()
 
-    def forward_from_pinned_buffers():
-        # Current kt_kernel API: enqueue CPU MoE, enqueue its synchronization,
-        # then copy the completed pinned CPU output back to CUDA.
-        wrapper.forward_on_pinned_buffers(hidden_states, stream.cuda_stream)
-        return wrapper.sync_forward(hidden_states, stream.cuda_stream)
+    def run_cpu_moe():
+        # Use KT's synchronous pinned-buffer path instead of a CUDA host node.
+        # This constructs, submits, and synchronizes a fresh CPU task every time.
+        wrapper.run_pinned_forward_sync(hidden_states, stream.cuda_stream)
 
     stream.wait_stream(torch.cuda.current_stream(DEVICE))
     with torch.cuda.stream(stream):
         stage_inputs()
-        for _ in range(WARMUP):
-            forward_from_pinned_buffers()
-        stream.synchronize()
-
-        # Re-stage explicitly before capture. The captured graph therefore has
-        # no hidden-state, expert-ID, or expert-weight D2H operation.
-        stage_inputs()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            output = forward_from_pinned_buffers()
 
         buffers = KExpertsCPUBuffer.get_buffer(
             hidden_states.view(-1, hidden_states.shape[-1]),
@@ -102,6 +91,17 @@ def measure_ms(wrapper, hidden_states, expert_ids, expert_weights, stream) -> fl
         )
         current_slot = wrapper.layer_idx % KExpertsCPUBuffer.buffer_depth
         output_cpu = buffers[4][current_slot]
+
+        # Warm both the CPU MoE and the pinned-output H2D before capture.
+        for _ in range(WARMUP):
+            run_cpu_moe()
+            output = wrapper.copy_forward_output_to_device(hidden_states)
+        stream.synchronize()
+
+        # Re-stage and compute the reference before capture. The graph contains
+        # only the routed output H2D; it has no input D2H or fragile host nodes.
+        stage_inputs()
+        run_cpu_moe()
         reference_cpu = output_cpu.clone()
         reference_nonfinite = torch.count_nonzero(~torch.isfinite(reference_cpu)).item()
         if reference_nonfinite:
@@ -111,6 +111,10 @@ def measure_ms(wrapper, hidden_states, expert_ids, expert_weights, stream) -> fl
             )
         if torch.count_nonzero(reference_cpu).item() == 0:
             raise RuntimeError("Eager KT CPU MoE produced an all-zero reference output")
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = wrapper.copy_forward_output_to_device(hidden_states)
 
         def verify_fresh_output(phase: str):
             nonzero = torch.count_nonzero(output_cpu).item()
@@ -128,8 +132,9 @@ def measure_ms(wrapper, hidden_states, expert_ids, expert_weights, stream) -> fl
 
         for warmup_index in range(WARMUP):
             # A finite sentinel avoids contaminating implementations that read
-            # the destination while still detecting a skipped CPU callback.
+            # the destination while still detecting a skipped CPU task.
             output_cpu.zero_()
+            run_cpu_moe()
             graph.replay()
             stream.synchronize()
             verify_fresh_output(f"warmup {warmup_index + 1}")
@@ -138,6 +143,7 @@ def measure_ms(wrapper, hidden_states, expert_ids, expert_weights, stream) -> fl
         for repeat_index in range(REPEATS):
             output_cpu.zero_()
             start = time.perf_counter()
+            run_cpu_moe()
             graph.replay()
             stream.synchronize()
             samples_ms.append((time.perf_counter() - start) * 1000)
@@ -160,7 +166,8 @@ def save_results(gpu_name: str, results: list[tuple[int, float]]):
         "Timed: KT task submit/sync, CPU routed experts, and routed output H2D.",
         "Excluded: shared expert, router, and all input D2H copies.",
         "Hidden states, expert IDs, and expert weights are copied to KT pinned CPU buffers before capture/timing.",
-        "Timer: perf_counter around one graph replay plus stream.synchronize.",
+        "Timer: perf_counter around one KT synchronous CPU MoE, output-H2D graph replay, and stream.synchronize.",
+        "CUDA Graph contains output H2D; CPU submit/sync runs immediately before each paired replay.",
         "Every replay clears and checks the CPU output against an eager reference.",
         "Expert IDs are random and unique per token.",
         "",
