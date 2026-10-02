@@ -7,6 +7,7 @@ import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.utils import is_sm100_supported
 
+from ._fa_import import load_flash_attn_with_kvcache
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
 
@@ -155,7 +156,7 @@ def _fa_sgl_impl(
     causal: bool = True,
 ) -> torch.Tensor:
     try:
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+        flash_attn_with_kvcache = load_flash_attn_with_kvcache(version)
     except ImportError as e:
         raise ImportError(
             "sgl_kernel.flash_attn is not found. Please install it with `pip install sgl-kernel`.\n"
