@@ -8,13 +8,14 @@ from pathlib import Path
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "6")
 
 import torch
-from minisgl.attention.fi import FlashInferBackend
+from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import set_tp_info
 from minisgl.kvcache.mha_pool import MHAKVCache
 from minisgl.layers import set_rope_device
 from minisgl.models.config import ModelConfig
 from test_gpu_single_attn_perf import (
+    ATTN_BACKEND,
     DEVICE,
     LAYER_INDEX,
     LAYER_NUMBER,
@@ -104,6 +105,8 @@ def make_decode_batch(context: Context, batch_size: int, sequence_length: int):
 
 @torch.inference_mode()
 def main():
+    if ATTN_BACKEND not in ("fi", "fa"):
+        raise ValueError(f"ATTN_BACKEND must be 'fi' or 'fa', got {ATTN_BACKEND!r}")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available.")
 
@@ -133,6 +136,7 @@ def main():
             f"Expected GLM-4.5-Air attention shape {expected_shape}, got {actual_shape}"
         )
 
+    print(f"Attention backend: {ATTN_BACKEND}", flush=True)
     print(f"Loading GLM-4.5-Air layer {LAYER_NUMBER} GPU weights ...", flush=True)
     layer = load_decoder_layer(config)
     initialize_kv_cache(context, config)
@@ -142,7 +146,7 @@ def main():
     for batch_size, sequence_length in [SHORT_SEQUENCE_CONFIG, *CONFIGS]:
         hidden, residual = make_inputs(config, batch_size)
         batch = make_decode_batch(context, batch_size, sequence_length)
-        backend = FlashInferBackend(config)
+        backend = create_attention_backend(ATTN_BACKEND, config)
         context.attn_backend = backend
         backend.init_capture_graph(
             max_seq_len=sequence_length, bs_list=[batch_size]
@@ -152,6 +156,9 @@ def main():
         operation = partial(gpu_overlap_path, layer, hidden, residual)
         with context.forward_batch(batch):
             graph, output = capture_graph(operation)
+            # Match server replay preparation: FA capture uses placeholder KV lengths.
+            backend.prepare_metadata(batch)
+            backend.prepare_for_replay(batch)
             latency_ms = measure_gpu_ms(graph)
         total_context = batch_size * sequence_length
         results.append((batch_size, sequence_length, total_context, latency_ms))
@@ -171,6 +178,7 @@ def main():
     lines = [
         f"GLM-4.5-Air layer {LAYER_NUMBER} GPU overlap path",
         f"GPU: {gpu_name}",
+        f"Attention backend: {ATTN_BACKEND}",
         f"CUDA Graph: on, warmup: {WARMUP}, repeats: {REPEATS}",
         "Includes norms, attention, shared expert and MoE router; excludes routed experts.",
         "",

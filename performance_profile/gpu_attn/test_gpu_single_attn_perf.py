@@ -9,7 +9,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "6")
 
 import torch
 import torch.nn.functional as F
-from minisgl.attention.fi import FlashInferBackend
+from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import set_tp_info
 from minisgl.kvcache.mha_pool import MHAKVCache
@@ -20,6 +20,7 @@ from minisgl.models.gguf import GGUFWeights
 from minisgl.utils import torch_dtype
 from transformers import AutoConfig
 
+ATTN_BACKEND = "fi"  # "fi" or "fa", same as the server's --attention-backend.
 MODEL_PATH = "/data2/models/GLM-4.5-Air-GGUF"
 WEIGHT_PATH = "/data2/models/GLM-4.5-Air-GGUF/IQ4_XS"
 LAYER_NUMBER = 7
@@ -294,6 +295,8 @@ def measure_gpu_ms(graph: torch.cuda.CUDAGraph) -> float:
 
 @torch.inference_mode()
 def main():
+    if ATTN_BACKEND not in ("fi", "fa"):
+        raise ValueError(f"ATTN_BACKEND must be 'fi' or 'fa', got {ATTN_BACKEND!r}")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available.")
 
@@ -320,6 +323,7 @@ def main():
             f"Expected GLM-4.5-Air attention shape {expected_shape}, got {actual_shape}"
         )
 
+    print(f"Attention backend: {ATTN_BACKEND}", flush=True)
     print(f"Loading GLM-4.5-Air layer {LAYER_NUMBER} GPU weights ...", flush=True)
     layer = load_decoder_layer(config)
     initialize_kv_cache(context, config, max_length)
@@ -329,13 +333,16 @@ def main():
     for sequence_length in SEQUENCE_LENGTHS:
         hidden, residual = make_inputs(config)
         batch = make_decode_batch(sequence_length)
-        backend = FlashInferBackend(config)
+        backend = create_attention_backend(ATTN_BACKEND, config)
         context.attn_backend = backend
         backend.init_capture_graph(max_seq_len=max_length, bs_list=[1])
         backend.prepare_for_capture(batch)
         operation = partial(gpu_overlap_path, layer, hidden, residual)
         with context.forward_batch(batch):
             graph, output = capture_graph(operation)
+            # Match server replay preparation: FA capture uses placeholder KV lengths.
+            backend.prepare_metadata(batch)
+            backend.prepare_for_replay(batch)
             results.append((sequence_length, measure_gpu_ms(graph)))
 
         graph.reset()
@@ -346,6 +353,7 @@ def main():
     lines = [
         f"GLM-4.5-Air layer {LAYER_NUMBER} GPU overlap path",
         f"GPU: {gpu_name}",
+        f"Attention backend: {ATTN_BACKEND}",
         f"Batch size: 1, CUDA Graph: on, repeats: {REPEATS}",
         "Includes norms, attention, shared expert and MoE router; excludes routed experts.",
         "",
