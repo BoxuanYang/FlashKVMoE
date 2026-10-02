@@ -20,8 +20,8 @@ from minisgl.models.gguf import GGUFWeights
 from minisgl.utils import torch_dtype
 from transformers import AutoConfig
 
-MODEL_PATH = "/data1/models/GLM-4.5-Air-GGUF"
-WEIGHT_PATH = "/data1/models/GLM-4.5-Air-GGUF/IQ4_XS"
+MODEL_PATH = "/data2/models/GLM-4.5-Air-GGUF"
+WEIGHT_PATH = "/data2/models/GLM-4.5-Air-GGUF/IQ4_XS"
 LAYER_NUMBER = 7
 LAYER_INDEX = LAYER_NUMBER - 1  # Human layer 7 is GGUF blk.6.
 
