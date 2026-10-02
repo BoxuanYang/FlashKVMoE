@@ -10,14 +10,14 @@ import torch
 from minisgl.models.config import ModelConfig
 from transformers import AutoConfig
 
-MODEL_PATH = "/data1/models/GLM-4.5-Air-GGUF"
-WEIGHT_PATH = "/data1/models/GLM-4.5-Air-GGUF/IQ4_XS"
+MODEL_PATH = "/data2/models/GLM-4.5-Air-GGUF"
+WEIGHT_PATH = "/data2/models/GLM-4.5-Air-GGUF/IQ4_XS"
 
 LAYER_NUMBER = 8
 LAYER_INDEX = LAYER_NUMBER - 1
 BATCH_SIZES = range(1, 257)
 
-CPU_THREADS = 64
+CPU_THREADS = 128
 THREAD_POOL_COUNT = 2
 WARMUP = 3
 REPEATS = 40
