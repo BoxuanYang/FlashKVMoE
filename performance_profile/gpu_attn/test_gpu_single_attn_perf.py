@@ -20,7 +20,7 @@ from minisgl.models.gguf import GGUFWeights
 from minisgl.utils import torch_dtype
 from transformers import AutoConfig
 
-ATTN_BACKEND = "fi"  # "fi" or "fa", same as the server's --attention-backend.
+ATTN_BACKEND = "fa"  # "fi" or "fa", same as the server's --attention-backend.
 MODEL_PATH = "/data2/models/GLM-4.5-Air-GGUF"
 WEIGHT_PATH = "/data2/models/GLM-4.5-Air-GGUF/IQ4_XS"
 LAYER_NUMBER = 7
