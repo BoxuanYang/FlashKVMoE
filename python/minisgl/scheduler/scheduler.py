@@ -105,11 +105,15 @@ class Scheduler(SchedulerIOMixin):
             self._process_one_msg(msg)
 
         # forward_input： scheduler.ForwardInput
+
+        # 关注
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
+
+                # 运行模型入口
                 ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(last_data)

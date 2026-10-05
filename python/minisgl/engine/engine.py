@@ -86,6 +86,8 @@ class Engine:
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
+
+        logger.info_rank0(f"Aligned max sequence length: {self.max_seq_len}")
         aligned_max_seq_len = _align_up_32(self.max_seq_len)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
