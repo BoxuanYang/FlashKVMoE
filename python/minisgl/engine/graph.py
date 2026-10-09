@@ -140,10 +140,14 @@ class GraphRunner:
             self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
+                get_global_ctx().kv_cache.sync_kv_offload()
                 # Finish warmup (including CPU expert callbacks) before capture.
                 self.stream.synchronize()
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
+                    # Join the side D2H stream so every captured graph is a
+                    # self-contained fork/join graph and staging is reusable.
+                    get_global_ctx().kv_cache.sync_kv_offload()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph

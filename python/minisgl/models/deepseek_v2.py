@@ -18,6 +18,7 @@ from minisgl.layers import (
 )
 from minisgl.layers.marlin import MarlinLinear
 from minisgl.layers.rotary import get_rope
+from minisgl.moe.ktransformers import forward_with_kv_shadow
 from minisgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
@@ -68,9 +69,7 @@ class DeepseekMoE(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ids, weights = self.gate.forward(x)
         shared = self.shared_experts.forward(x)
-        routed = self._wrapper.forward(
-            x, ids, weights, torch.cuda.current_stream(x.device).cuda_stream
-        )
+        routed = forward_with_kv_shadow(self._wrapper, x, ids, weights)
         return shared + routed
 
 

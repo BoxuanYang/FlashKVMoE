@@ -30,6 +30,8 @@ def create_kvcache_pool(
     page_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    num_cpu_pages: int | None = None,
+    max_transfer_tokens: int = 1,
 ) -> BaseKVCachePool:
     if model_config.is_mla:
         from .mla_pool import MLAKVCache
@@ -45,6 +47,8 @@ def create_kvcache_pool(
         head_dim=model_config.head_dim,
         device=device,
         dtype=dtype,
+        num_cpu_pages=num_cpu_pages,
+        max_transfer_tokens=max_transfer_tokens,
     )
 
 

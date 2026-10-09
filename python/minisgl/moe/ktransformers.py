@@ -4,6 +4,7 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
+from minisgl.core import get_global_ctx
 from minisgl.layers import BaseOP, LinearReplicated
 
 if TYPE_CHECKING:
@@ -73,6 +74,46 @@ def _create_kt_wrapper(config: EngineConfig, layer_id: int, max_graph_bs: int):
     return wrapper
 
 
+def forward_with_kv_shadow(
+    wrapper,
+    hidden_states: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Run KT while shadowing this layer's newly generated KV in CPU DRAM.
+
+    KT already exposes the exact split needed here: ``submit_forward`` queues
+    expert_ids/hidden_states/weights D2H and the CPU task, while ``sync_forward``
+    waits for CPU completion and copies its output H2D. The KV D2H is inserted
+    between them, so it overlaps CPU MoE without contending with KT input D2H.
+    """
+    stream = torch.cuda.current_stream(hidden_states.device)
+    try:
+        kv_cache = get_global_ctx().kv_cache
+    except (AssertionError, AttributeError):
+        kv_cache = None
+    if kv_cache is None or not kv_cache.shadow_enabled:
+        return wrapper.forward(
+            hidden_states, expert_ids, expert_weights, stream.cuda_stream
+        )
+
+    kv_cache.sync_kv_offload()
+    wrapper.submit_forward(hidden_states, expert_ids, expert_weights, stream.cuda_stream)
+    kv_cache.submit_kv_offload(wrapper.layer_idx)
+    return wrapper.sync_forward(hidden_states, stream.cuda_stream)
+
+
+def submit_dense_layer_kv_shadow(layer_id: int) -> None:
+    """Shadow a layer that has no routed CPU MoE submission window."""
+    try:
+        kv_cache = get_global_ctx().kv_cache
+    except (AssertionError, AttributeError):
+        return
+    if kv_cache.shadow_enabled:
+        kv_cache.sync_kv_offload()
+        kv_cache.submit_kv_offload(layer_id)
+
+
 class KTransformersMoE(BaseOP):
     """Complete MoE MLP: GPU router and a direct KT CPU expert wrapper."""
 
@@ -93,9 +134,4 @@ class KTransformersMoE(BaseOP):
             weights = weights / weights.sum(dim=-1, keepdim=True)
 
         # type(self._wrapper): <class 'kt_kernel.utils.llamafile.LlamafileMoEWrapper'>
-        return self._wrapper.forward(
-            hidden_states,
-            ids,
-            weights,
-            torch.cuda.current_stream(hidden_states.device).cuda_stream,
-        )
+        return forward_with_kv_shadow(self._wrapper, hidden_states, ids, weights)

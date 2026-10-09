@@ -181,6 +181,9 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
+        # Gather the just-produced K/V while they are still contiguous. The
+        # staged rows are submitted D2H after KT queues its expert inputs.
+        self.kvcache.gather_kv(k, v, batch.out_loc, layer_id)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))

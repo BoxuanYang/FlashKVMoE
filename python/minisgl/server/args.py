@@ -170,6 +170,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--num-cpu-pages",
+        dest="num_cpu_page_override",
+        type=int,
+        default=ServerArgs.num_cpu_page_override,
+        help="Set host-side KV shadow capacity in pages. Defaults to the GPU KV page count.",
+    )
+
+    parser.add_argument(
         "--page-size",
         type=int,
         default=ServerArgs.page_size,

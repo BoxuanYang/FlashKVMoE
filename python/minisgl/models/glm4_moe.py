@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.layers import AttentionLayer, BaseOP, OPList, RMSNormFused, VocabParallelEmbedding
 from minisgl.layers.marlin import MarlinLinear
+from minisgl.moe.ktransformers import forward_with_kv_shadow, submit_dense_layer_kv_shadow
 
 from .base import BaseLLMModel
 from .config import ModelConfig
@@ -51,9 +52,7 @@ class Glm4MoeSparseMLP(BaseOP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ids, weights = self.gate.forward(x)
-        routed = self._wrapper.forward(
-            x, ids, weights, torch.cuda.current_stream(x.device).cuda_stream
-        )
+        routed = forward_with_kv_shadow(self._wrapper, x, ids, weights)
         return routed + self.shared_experts.forward(x)
 
 
@@ -77,10 +76,12 @@ class Glm4MoeAttention(BaseOP):
 
 class Glm4MoeDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
+        self._layer_id = layer_id
+        self._is_dense = layer_id < config.first_k_dense_replace
         self.self_attn = Glm4MoeAttention(config, layer_id)
         self.mlp = (
             Glm4MoeMLP(config.hidden_size, config.intermediate_size)
-            if layer_id < config.first_k_dense_replace
+            if self._is_dense
             else Glm4MoeSparseMLP(config)
         )
         self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
@@ -90,6 +91,10 @@ class Glm4MoeDecoderLayer(BaseOP):
         x, residual = self.input_layernorm.forward(x, residual)
         x = self.self_attn.forward(x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
+        if self._is_dense:
+            # There is no KT expert-input copy in a dense layer. Start its KV
+            # shadow here so the D2H can overlap the dense MLP instead.
+            submit_dense_layer_kv_shadow(self._layer_id)
         return self.mlp.forward(x), residual
 
 

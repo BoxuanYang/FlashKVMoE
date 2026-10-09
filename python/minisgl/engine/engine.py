@@ -75,12 +75,15 @@ class Engine:
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
+        self.num_cpu_pages = config.num_cpu_page_override or self.num_pages + 1
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            num_cpu_pages=self.num_cpu_pages,
+            max_transfer_tokens=config.max_forward_len,
         )
 
         # ======================= Page table initialization ========================
@@ -209,10 +212,14 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
+            # Do not let a new batch overwrite staging that the prior batch is
+            # still shadowing. This inserts a stream dependency, not a CPU wait.
+            self.kv_cache.sync_kv_offload()
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+                self.kv_cache.sync_kv_offload()
 
         for req in batch.reqs:
             req.complete_one()

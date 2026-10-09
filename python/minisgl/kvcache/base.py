@@ -24,6 +24,21 @@ class BaseKVCachePool(ABC):
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None: ...
 
+    def gather_kv(
+        self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
+    ) -> None:
+        """Gather newly generated KV for asynchronous host shadowing, if supported."""
+
+    def submit_kv_offload(self, layer_id: int) -> None:
+        """Submit a generated layer to the host shadow, if supported."""
+
+    def sync_kv_offload(self) -> None:
+        """Order subsequent device work after the latest host-shadow update."""
+
+    @property
+    def shadow_enabled(self) -> bool:
+        return False
+
     @property
     @abstractmethod
     def device(self) -> torch.device: ...
