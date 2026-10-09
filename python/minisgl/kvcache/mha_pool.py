@@ -110,7 +110,6 @@ class MHAKVCache(BaseKVCachePool):
             dtype=torch.int32,
             pin_memory=pin_memory,
         )
-        self._prefill_capacity = 0
         self._prefill_staging_gpu: torch.Tensor | None = None
         self._prefill_staging_cpu: torch.Tensor | None = None
         self._prefill_indices_gpu: torch.Tensor | None = None
@@ -191,11 +190,10 @@ class MHAKVCache(BaseKVCachePool):
                 dtype=torch.int32,
                 pin_memory=self._device.type == "cuda",
             )
-            self._prefill_capacity = count
-        elif count != self._prefill_capacity:
+        elif count != self._prefill_staging_gpu.shape[1]:
             raise RuntimeError(
                 "Prefill KV token count changed within one batch: "
-                f"expected {self._prefill_capacity}, got {count}"
+                f"expected {self._prefill_staging_gpu.shape[1]}, got {count}"
             )
         assert self._prefill_staging_gpu is not None
         assert self._prefill_indices_gpu is not None
@@ -219,7 +217,6 @@ class MHAKVCache(BaseKVCachePool):
         self._prefill_staging_cpu = None
         self._prefill_indices_gpu = None
         self._prefill_indices_cpu = None
-        self._prefill_capacity = 0
 
     def get_buffer(
         self, prefill: bool

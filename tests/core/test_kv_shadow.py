@@ -63,13 +63,11 @@ def test_prefill_staging_is_exact_size_and_released_per_batch(monkeypatch):
 
     assert pool._decode_capacity == 1
     assert pool._decode_staging_gpu is decode_staging
-    assert pool._prefill_capacity == 3
     assert pool._prefill_staging_gpu is not None
     assert pool._prefill_staging_gpu.shape[1] == 3
 
     pool.release_prefill_kv_offload()
 
-    assert pool._prefill_capacity == 0
     assert pool._prefill_staging_gpu is None
     assert pool._prefill_staging_cpu is None
     assert pool._prefill_indices_gpu is None
