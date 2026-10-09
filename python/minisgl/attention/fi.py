@@ -181,9 +181,12 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
-        # Gather the just-produced K/V while they are still contiguous. The
-        # staged rows are submitted D2H after KT queues its expert inputs.
-        self.kvcache.gather_kv(k, v, batch.out_loc, layer_id)
+        # CUDA Graph capture only sees the decode branch (capture batches have
+        # phase="decode"). Prefill remains eager and may use growable staging.
+        if batch.is_prefill:
+            self.kvcache.gather_prefill_kv(k, v, batch.out_loc, layer_id)
+        else:
+            self.kvcache.gather_decode_kv(k, v, batch.out_loc, layer_id)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
@@ -191,6 +194,11 @@ class FlashInferBackend(BaseAttnBackend):
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
+
+        # out_loc is already populated by the scheduler. Allocate/grow eager
+        # prefill staging once per batch, before entering the model layer loop.
+        if batch.is_prefill:
+            self.kvcache.prepare_prefill_kv_offload(batch.out_loc.numel())
 
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]

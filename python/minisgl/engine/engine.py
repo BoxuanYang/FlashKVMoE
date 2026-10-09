@@ -83,7 +83,9 @@ class Engine:
             device=self.device,
             dtype=self.dtype,
             num_cpu_pages=self.num_cpu_pages,
-            max_transfer_tokens=config.max_forward_len,
+            # Decode staging is graph-stable and only needs to cover the
+            # largest possible decode batch. Prefill has growable eager staging.
+            max_transfer_tokens=max(config.max_running_req, max(cuda_graph_bs, default=1)),
         )
 
         # ======================= Page table initialization ========================

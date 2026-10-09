@@ -31,7 +31,8 @@ def test_gather_then_store_builds_host_shadow(monkeypatch):
     k = torch.arange(8, dtype=torch.float32).view(2, 1, 4)
     v = k + 100
 
-    pool.gather_kv(k, v, locations, layer_id=1)
+    pool.prepare_prefill_kv_offload(num_tokens=2)
+    pool.gather_prefill_kv(k, v, locations, layer_id=1)
     pool.store_kv(k, v, locations, layer_id=1)
     pool.submit_kv_offload(layer_id=1)
 
@@ -40,15 +41,41 @@ def test_gather_then_store_builds_host_shadow(monkeypatch):
     assert pool.num_cpu_pages == 6
 
 
-def test_flashinfer_gathers_before_paged_store(monkeypatch):
+def test_prefill_staging_grows_without_resizing_decode_staging(monkeypatch):
+    monkeypatch.setattr(dist_info, "_TP_INFO", DistributedInfo(0, 1))
+    pool = MHAKVCache(
+        num_kv_heads=1,
+        num_layers=1,
+        head_dim=4,
+        num_pages=4,
+        page_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_cpu_pages=4,
+        max_transfer_tokens=1,
+    )
+
+    pool.prepare_prefill_kv_offload(num_tokens=3)
+
+    assert pool._decode_capacity == 1
+    assert pool._decode_staging_gpu.shape[1] == 1
+    assert pool._prefill_capacity == 4
+    assert pool._prefill_staging_gpu is not None
+    assert pool._prefill_staging_gpu.shape[1] == 4
+
+
+def test_flashinfer_selects_phase_gather_before_paged_store(monkeypatch):
     calls = []
 
     class Cache:
         device = torch.device("cpu")
         dtype = torch.float32
 
-        def gather_kv(self, k, v, out_loc, layer_id):
-            calls.append("gather")
+        def gather_decode_kv(self, k, v, out_loc, layer_id):
+            calls.append("decode-gather")
+
+        def gather_prefill_kv(self, k, v, out_loc, layer_id):
+            calls.append("prefill-gather")
 
         def store_kv(self, k, v, out_loc, layer_id):
             calls.append("store")
@@ -71,15 +98,22 @@ def test_flashinfer_gathers_before_paged_store(monkeypatch):
     backend = fi.FlashInferBackend.__new__(fi.FlashInferBackend)
     backend.kvcache = Cache()
     backend._initialize_metadata_once = lambda metadata: None
-    batch = SimpleNamespace(
-        attn_metadata=Metadata(), out_loc=torch.tensor([0], dtype=torch.int32)
-    )
     q = torch.zeros(1, 1, 2)
     k = torch.ones(1, 1, 2)
     v = torch.full((1, 1, 2), 2.0)
 
-    assert backend.forward(q, k, v, layer_id=0, batch=batch) is q
-    assert calls == ["gather", "store", "attention"]
+    for is_prefill, expected in (
+        (True, "prefill-gather"),
+        (False, "decode-gather"),
+    ):
+        batch = SimpleNamespace(
+            attn_metadata=Metadata(),
+            out_loc=torch.tensor([0], dtype=torch.int32),
+            is_prefill=is_prefill,
+        )
+        assert backend.forward(q, k, v, layer_id=0, batch=batch) is q
+        assert calls == [expected, "store", "attention"]
+        calls.clear()
 
 
 def test_kt_submission_wraps_kv_d2h_around_cpu_moe(monkeypatch):
@@ -104,9 +138,7 @@ def test_kt_submission_wraps_kv_d2h_around_cpu_moe(monkeypatch):
             calls.append("moe-sync")
             return hidden
 
-    monkeypatch.setattr(
-        ktransformers, "get_global_ctx", lambda: SimpleNamespace(kv_cache=Cache())
-    )
+    monkeypatch.setattr(ktransformers, "get_global_ctx", lambda: SimpleNamespace(kv_cache=Cache()))
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=123)
     )

@@ -86,21 +86,23 @@ class MHAKVCache(BaseKVCachePool):
             head_dim,
         )
 
-        # Two slots are sufficient: layer L+1 waits for layer L before layer L+2
-        # reuses its slot. Interleaved [token, K/V, ...] makes KV one D2H DMA.
-        self._max_transfer_tokens = max_transfer_tokens
-        staging_shape = (2, max_transfer_tokens, 2, local_kv_heads, head_dim)
-        self._staging_gpu = torch.empty(staging_shape, device=device, dtype=dtype)
-        self._staging_cpu = torch.empty(
-            staging_shape, device="cpu", dtype=dtype, pin_memory=pin_memory
-        )
-        self._indices_gpu = torch.empty(
-            (2, max_transfer_tokens), device=device, dtype=torch.int32
-        )
-        self._indices_cpu = torch.empty(
-            (2, max_transfer_tokens), device="cpu", dtype=torch.int32, pin_memory=pin_memory
-        )
+        # Decode buffers are captured by CUDA Graph and must retain both their
+        # capacity and addresses. Prefill is eager-only, so it uses a separate
+        # high-watermark allocation sized for the current prefill batch.
+        self._decode_capacity = max_transfer_tokens
+        (
+            self._decode_staging_gpu,
+            self._decode_staging_cpu,
+            self._decode_indices_gpu,
+            self._decode_indices_cpu,
+        ) = self._allocate_staging(max_transfer_tokens, pin_memory)
+        self._prefill_capacity = 0
+        self._prefill_staging_gpu: torch.Tensor | None = None
+        self._prefill_staging_cpu: torch.Tensor | None = None
+        self._prefill_indices_gpu: torch.Tensor | None = None
+        self._prefill_indices_cpu: torch.Tensor | None = None
         self._staged_counts = [0] * num_layers
+        self._staged_is_prefill = [False] * num_layers
         self._shadow_enabled = device.type == "cuda"
         self._offload_stream = torch.cuda.Stream(device=device) if self._shadow_enabled else None
         self._ready_events = (
@@ -111,6 +113,18 @@ class MHAKVCache(BaseKVCachePool):
         )
         self._last_done_event: torch.cuda.Event | None = None
         self._host_scatter = None
+
+    def _allocate_staging(
+        self, capacity: int, pin_memory: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        shape = (2, capacity, 2, self._storage_shape[1], self._storage_shape[2])
+        staging_gpu = torch.empty(shape, device=self._device, dtype=self.dtype)
+        staging_cpu = torch.empty(shape, device="cpu", dtype=self.dtype, pin_memory=pin_memory)
+        indices_gpu = torch.empty((2, capacity), device=self._device, dtype=torch.int32)
+        indices_cpu = torch.empty(
+            (2, capacity), device="cpu", dtype=torch.int32, pin_memory=pin_memory
+        )
+        return staging_gpu, staging_cpu, indices_gpu, indices_cpu
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]
@@ -124,22 +138,92 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache_cpu(self, index: int) -> torch.Tensor:
         return self._v_buffer_cpu[index]
 
+    def _gather_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out_loc: torch.Tensor,
+        layer_id: int,
+        *,
+        prefill: bool,
+    ) -> None:
+        count = out_loc.numel()
+        capacity = self._prefill_capacity if prefill else self._decode_capacity
+        if count > capacity:
+            phase = "prefill" if prefill else "decode"
+            raise ValueError(
+                f"KV shadow {phase} transfer has {count} tokens, exceeding its "
+                f"staging capacity of {capacity}"
+            )
+        staging_gpu, _, indices_gpu, _ = self._staging_for(prefill)
+        slot = layer_id % 2
+        shape = (count, self._storage_shape[1], self._storage_shape[2])
+        staging_gpu[slot, :count, 0].copy_(k.view(shape))
+        staging_gpu[slot, :count, 1].copy_(v.view(shape))
+        indices_gpu[slot, :count].copy_(out_loc)
+        self._staged_counts[layer_id] = count
+        self._staged_is_prefill[layer_id] = prefill
+
     def gather_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
-        """Gather newly generated KV into the graph-stable GPU staging slot."""
-        count = out_loc.numel()
-        if count > self._max_transfer_tokens:
-            raise ValueError(
-                f"KV shadow transfer has {count} tokens, exceeding its preallocated "
-                f"capacity of {self._max_transfer_tokens}"
+        """Backward-compatible alias for the graph-stable decode gather."""
+        self.gather_decode_kv(k, v, out_loc, layer_id)
+
+    def gather_decode_kv(
+        self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
+    ) -> None:
+        """Gather decode KV into the fixed-address CUDA Graph staging slot."""
+        self._gather_kv(k, v, out_loc, layer_id, prefill=False)
+
+    def prepare_prefill_kv_offload(self, num_tokens: int) -> None:
+        """Grow eager prefill staging once, before the model enters its layer loop."""
+        if num_tokens <= self._prefill_capacity:
+            return
+        if num_tokens <= 0:
+            raise ValueError("Prefill KV shadow token count must be positive")
+
+        # Old eager callbacks may still reference the previous pinned buffers.
+        # Growth is outside CUDA Graph capture and rare, so a host wait here is
+        # preferable to retaining an unbounded list of retired allocations.
+        if self._last_done_event is not None:
+            self._last_done_event.synchronize()
+        capacity = 1 << (num_tokens - 1).bit_length()
+        pin_memory = self._device.type == "cuda"
+        (
+            self._prefill_staging_gpu,
+            self._prefill_staging_cpu,
+            self._prefill_indices_gpu,
+            self._prefill_indices_cpu,
+        ) = self._allocate_staging(capacity, pin_memory)
+        self._prefill_capacity = capacity
+
+    def gather_prefill_kv(
+        self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
+    ) -> None:
+        """Gather prefill KV into eager-only, high-watermark staging."""
+        self._gather_kv(k, v, out_loc, layer_id, prefill=True)
+
+    def _staging_for(
+        self, prefill: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not prefill:
+            return (
+                self._decode_staging_gpu,
+                self._decode_staging_cpu,
+                self._decode_indices_gpu,
+                self._decode_indices_cpu,
             )
-        slot = layer_id % 2
-        shape = (count, self._storage_shape[1], self._storage_shape[2])
-        self._staging_gpu[slot, :count, 0].copy_(k.view(shape))
-        self._staging_gpu[slot, :count, 1].copy_(v.view(shape))
-        self._indices_gpu[slot, :count].copy_(out_loc)
-        self._staged_counts[layer_id] = count
+        assert self._prefill_staging_gpu is not None
+        assert self._prefill_staging_cpu is not None
+        assert self._prefill_indices_gpu is not None
+        assert self._prefill_indices_cpu is not None
+        return (
+            self._prefill_staging_gpu,
+            self._prefill_staging_cpu,
+            self._prefill_indices_gpu,
+            self._prefill_indices_cpu,
+        )
 
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
@@ -160,10 +244,13 @@ class MHAKVCache(BaseKVCachePool):
         if count == 0:
             return
         slot = layer_id % 2
+        staging_gpu, staging_cpu, indices_gpu, indices_cpu = self._staging_for(
+            self._staged_is_prefill[layer_id]
+        )
         if not self._shadow_enabled:
-            self._staging_cpu[slot, :count].copy_(self._staging_gpu[slot, :count])
-            self._indices_cpu[slot, :count].copy_(self._indices_gpu[slot, :count])
-            self._scatter_staging(layer_id, slot, count)
+            staging_cpu[slot, :count].copy_(staging_gpu[slot, :count])
+            indices_cpu[slot, :count].copy_(indices_gpu[slot, :count])
+            self._scatter_staging(layer_id, slot, count, staging_cpu, indices_cpu)
             return
 
         assert self._offload_stream is not None
@@ -171,12 +258,8 @@ class MHAKVCache(BaseKVCachePool):
         self._ready_events[layer_id].record(producer)
         with torch.cuda.stream(self._offload_stream):
             self._offload_stream.wait_event(self._ready_events[layer_id])
-            self._staging_cpu[slot, :count].copy_(
-                self._staging_gpu[slot, :count], non_blocking=True
-            )
-            self._indices_cpu[slot, :count].copy_(
-                self._indices_gpu[slot, :count], non_blocking=True
-            )
+            staging_cpu[slot, :count].copy_(staging_gpu[slot, :count], non_blocking=True)
+            indices_cpu[slot, :count].copy_(indices_gpu[slot, :count], non_blocking=True)
             if self._host_scatter is None:
                 self._host_scatter = _load_kv_shadow_extension().HostScatterLauncher()
             row_bytes = self._storage_shape[1] * self._storage_shape[2] * self.dtype.itemsize
@@ -184,8 +267,8 @@ class MHAKVCache(BaseKVCachePool):
                 self._offload_stream.cuda_stream,
                 self.k_cache_cpu(layer_id).data_ptr(),
                 self.v_cache_cpu(layer_id).data_ptr(),
-                self._staging_cpu[slot].data_ptr(),
-                self._indices_cpu[slot].data_ptr(),
+                staging_cpu[slot].data_ptr(),
+                indices_cpu[slot].data_ptr(),
                 count,
                 row_bytes,
                 self._cpu_storage_shape[0],
@@ -193,15 +276,18 @@ class MHAKVCache(BaseKVCachePool):
             self._done_events[layer_id].record(self._offload_stream)
         self._last_done_event = self._done_events[layer_id]
 
-    def _scatter_staging(self, layer_id: int, slot: int, count: int) -> None:
-        indices = self._indices_cpu[slot, :count].long()
+    def _scatter_staging(
+        self,
+        layer_id: int,
+        slot: int,
+        count: int,
+        staging_cpu: torch.Tensor,
+        indices_cpu: torch.Tensor,
+    ) -> None:
+        indices = indices_cpu[slot, :count].long()
         shape = self._cpu_storage_shape
-        self.k_cache_cpu(layer_id).view(shape).index_copy_(
-            0, indices, self._staging_cpu[slot, :count, 0]
-        )
-        self.v_cache_cpu(layer_id).view(shape).index_copy_(
-            0, indices, self._staging_cpu[slot, :count, 1]
-        )
+        self.k_cache_cpu(layer_id).view(shape).index_copy_(0, indices, staging_cpu[slot, :count, 0])
+        self.v_cache_cpu(layer_id).view(shape).index_copy_(0, indices, staging_cpu[slot, :count, 1])
 
     def sync_kv_offload(self) -> None:
         """Order the current CUDA stream after the most recent host-shadow update.
