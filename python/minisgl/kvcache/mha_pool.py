@@ -116,13 +116,14 @@ class MHAKVCache(BaseKVCachePool):
         self._prefill_indices_cpu: torch.Tensor | None = None
         self._staged_counts = [0] * num_layers
         self._staged_is_prefill = [False] * num_layers
-        self._shadow_enabled = device.type == "cuda"
-        self._offload_stream = torch.cuda.Stream(device=device) if self._shadow_enabled else None
+        self._offload_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
         self._ready_events = (
-            [torch.cuda.Event() for _ in range(num_layers)] if self._shadow_enabled else []
+            [torch.cuda.Event() for _ in range(num_layers)] if device.type == "cuda" else []
         )
         self._done_events = (
-            [torch.cuda.Event() for _ in range(num_layers)] if self._shadow_enabled else []
+            [torch.cuda.Event() for _ in range(num_layers)] if device.type == "cuda" else []
         )
         self._last_done_event: torch.cuda.Event | None = None
         self._host_scatter = None
@@ -262,7 +263,7 @@ class MHAKVCache(BaseKVCachePool):
         staging_gpu, staging_cpu, indices_gpu, indices_cpu = self.get_buffer(
             self._staged_is_prefill[layer_id]
         )
-        if not self._shadow_enabled:
+        if self._device.type != "cuda":
             staging_cpu[slot, :count].copy_(staging_gpu[slot, :count])
             indices_cpu[slot, :count].copy_(indices_gpu[slot, :count])
             self._scatter_staging(layer_id, slot, count, staging_cpu, indices_cpu)
@@ -310,7 +311,7 @@ class MHAKVCache(BaseKVCachePool):
         This is a stream wait rather than a host synchronize, so it is safe to use
         while capturing and replaying CUDA graphs.
         """
-        if self._shadow_enabled and self._last_done_event is not None:
+        if self._device.type == "cuda" and self._last_done_event is not None:
             torch.cuda.current_stream(self._device).wait_event(self._last_done_event)
 
     @property
