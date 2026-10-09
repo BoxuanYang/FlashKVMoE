@@ -31,7 +31,6 @@ def test_gather_then_store_builds_host_shadow(monkeypatch):
     k = torch.arange(8, dtype=torch.float32).view(2, 1, 4)
     v = k + 100
 
-    pool.prepare_prefill_kv_offload(num_tokens=2)
     pool.gather_prefill_kv(k, v, locations, layer_id=1)
     pool.store_kv(k, v, locations, layer_id=1)
     pool.submit_kv_offload(layer_id=1)
@@ -41,7 +40,7 @@ def test_gather_then_store_builds_host_shadow(monkeypatch):
     assert pool.num_cpu_pages == 6
 
 
-def test_prefill_staging_grows_without_resizing_decode_staging(monkeypatch):
+def test_prefill_staging_is_exact_size_and_released_per_batch(monkeypatch):
     monkeypatch.setattr(dist_info, "_TP_INFO", DistributedInfo(0, 1))
     pool = MHAKVCache(
         num_kv_heads=1,
@@ -55,13 +54,26 @@ def test_prefill_staging_grows_without_resizing_decode_staging(monkeypatch):
         max_transfer_tokens=1,
     )
 
-    pool.prepare_prefill_kv_offload(num_tokens=3)
+    locations = torch.tensor([0, 1, 2], dtype=torch.int32)
+    k = torch.zeros(3, 1, 4)
+    v = torch.ones(3, 1, 4)
+    decode_staging = pool._decode_staging_gpu
+
+    pool.gather_prefill_kv(k, v, locations, layer_id=0)
 
     assert pool._decode_capacity == 1
-    assert pool._decode_staging_gpu.shape[1] == 1
-    assert pool._prefill_capacity == 4
+    assert pool._decode_staging_gpu is decode_staging
+    assert pool._prefill_capacity == 3
     assert pool._prefill_staging_gpu is not None
-    assert pool._prefill_staging_gpu.shape[1] == 4
+    assert pool._prefill_staging_gpu.shape[1] == 3
+
+    pool.release_prefill_kv_offload()
+
+    assert pool._prefill_capacity == 0
+    assert pool._prefill_staging_gpu is None
+    assert pool._prefill_staging_cpu is None
+    assert pool._prefill_indices_gpu is None
+    assert pool._prefill_indices_cpu is None
 
 
 def test_flashinfer_selects_phase_gather_before_paged_store(monkeypatch):

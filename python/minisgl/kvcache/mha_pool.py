@@ -87,8 +87,8 @@ class MHAKVCache(BaseKVCachePool):
         )
 
         # Decode buffers are captured by CUDA Graph and must retain both their
-        # capacity and addresses. Prefill is eager-only, so it uses a separate
-        # high-watermark allocation sized for the current prefill batch.
+        # capacity and addresses. Prefill gets a separate exact-size temporary
+        # allocation on its first layer and releases it when that batch ends.
         self._decode_capacity = max_transfer_tokens
         (
             self._decode_staging_gpu,
@@ -176,33 +176,41 @@ class MHAKVCache(BaseKVCachePool):
         """Gather decode KV into the fixed-address CUDA Graph staging slot."""
         self._gather_kv(k, v, out_loc, layer_id, prefill=False)
 
-    def prepare_prefill_kv_offload(self, num_tokens: int) -> None:
-        """Grow eager prefill staging once, before the model enters its layer loop."""
-        if num_tokens <= self._prefill_capacity:
-            return
-        if num_tokens <= 0:
-            raise ValueError("Prefill KV shadow token count must be positive")
-
-        # Old eager callbacks may still reference the previous pinned buffers.
-        # Growth is outside CUDA Graph capture and rare, so a host wait here is
-        # preferable to retaining an unbounded list of retired allocations.
-        if self._last_done_event is not None:
-            self._last_done_event.synchronize()
-        capacity = 1 << (num_tokens - 1).bit_length()
-        pin_memory = self._device.type == "cuda"
-        (
-            self._prefill_staging_gpu,
-            self._prefill_staging_cpu,
-            self._prefill_indices_gpu,
-            self._prefill_indices_cpu,
-        ) = self._allocate_staging(capacity, pin_memory)
-        self._prefill_capacity = capacity
-
     def gather_prefill_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
-        """Gather prefill KV into eager-only, high-watermark staging."""
+        """Allocate exact-size eager staging on the first prefill layer, then gather."""
+        count = out_loc.numel()
+        if self._prefill_staging_gpu is None:
+            if count <= 0:
+                raise ValueError("Prefill KV shadow token count must be positive")
+            (
+                self._prefill_staging_gpu,
+                self._prefill_staging_cpu,
+                self._prefill_indices_gpu,
+                self._prefill_indices_cpu,
+            ) = self._allocate_staging(count, self._device.type == "cuda")
+            self._prefill_capacity = count
+        elif count != self._prefill_capacity:
+            raise RuntimeError(
+                "Prefill KV token count changed within one batch: "
+                f"expected {self._prefill_capacity}, got {count}"
+            )
         self._gather_kv(k, v, out_loc, layer_id, prefill=True)
+
+    def release_prefill_kv_offload(self) -> None:
+        """Wait for the final eager callback, then discard this batch's staging."""
+        if self._prefill_staging_gpu is None:
+            return
+        # The raw pinned-memory pointers are passed to a CUDA host callback.
+        # They cannot be released until that callback has finished.
+        if self._last_done_event is not None:
+            self._last_done_event.synchronize()
+        self._prefill_staging_gpu = None
+        self._prefill_staging_cpu = None
+        self._prefill_indices_gpu = None
+        self._prefill_indices_cpu = None
+        self._prefill_capacity = 0
 
     def _staging_for(
         self, prefill: bool

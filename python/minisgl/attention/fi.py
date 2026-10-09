@@ -195,11 +195,6 @@ class FlashInferBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
 
-        # out_loc is already populated by the scheduler. Allocate/grow eager
-        # prefill staging once per batch, before entering the model layer loop.
-        if batch.is_prefill:
-            self.kvcache.prepare_prefill_kv_offload(batch.out_loc.numel())
-
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]

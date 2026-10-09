@@ -35,14 +35,14 @@ class BaseKVCachePool(ABC):
         """Gather decode KV into graph-stable staging, if supported."""
         self.gather_kv(k, v, out_loc, layer_id)
 
-    def prepare_prefill_kv_offload(self, num_tokens: int) -> None:
-        """Prepare eager-only staging for one prefill batch, if supported."""
-
     def gather_prefill_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
         """Gather prefill KV into eager staging, if supported."""
         self.gather_kv(k, v, out_loc, layer_id)
+
+    def release_prefill_kv_offload(self) -> None:
+        """Release per-batch eager prefill staging, if supported."""
 
     def submit_kv_offload(self, layer_id: int) -> None:
         """Submit a generated layer to the host shadow, if supported."""

@@ -220,8 +220,12 @@ class Engine:
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
-                logits = self.model.forward()
-                self.kv_cache.sync_kv_offload()
+                try:
+                    logits = self.model.forward()
+                    self.kv_cache.sync_kv_offload()
+                finally:
+                    if batch.is_prefill:
+                        self.kv_cache.release_prefill_kv_offload()
 
         for req in batch.reqs:
             req.complete_one()
