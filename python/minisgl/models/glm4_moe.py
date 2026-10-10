@@ -6,6 +6,7 @@ from minisgl.core import get_global_ctx
 from minisgl.layers import AttentionLayer, BaseOP, OPList, RMSNormFused, VocabParallelEmbedding
 from minisgl.layers.marlin import MarlinLinear
 from minisgl.moe.ktransformers import forward_with_kv_shadow, submit_dense_layer_kv_shadow
+from minisgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
 from .config import ModelConfig
@@ -87,15 +88,21 @@ class Glm4MoeDecoderLayer(BaseOP):
         self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
 
+    @nvtx_annotate("Layer-{}", layer_id_field="_layer_id")
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None):
-        x, residual = self.input_layernorm.forward(x, residual)
-        x = self.self_attn.forward(x)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        if self._is_dense:
-            # There is no KT expert-input copy in a dense layer. Start its KV
-            # shadow here so the D2H can overlap the dense MLP instead.
-            submit_dense_layer_kv_shadow(self._layer_id)
-        return self.mlp.forward(x), residual
+        with torch.cuda.nvtx.range(f"Layer-{self._layer_id}_attn"):
+            x, residual = self.input_layernorm.forward(x, residual)
+            x = self.self_attn.forward(x)
+            x, residual = self.post_attention_layernorm.forward(x, residual)
+
+        with torch.cuda.nvtx.range(f"Layer-{self._layer_id}_moe"):
+            if self._is_dense:
+                # There is no KT expert-input copy in a dense layer. Start its KV
+                # shadow here so the D2H can overlap the dense MLP instead.
+                submit_dense_layer_kv_shadow(self._layer_id)
+            x = self.mlp.forward(x)
+
+        return x, residual
 
 
 class Glm4MoeModel(BaseOP):

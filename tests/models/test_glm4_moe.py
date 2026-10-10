@@ -1,8 +1,10 @@
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import gguf
+import minisgl.models.glm4_moe as glm4_moe
 import numpy as np
 import torch
 from minisgl.distributed import DistributedInfo
@@ -11,7 +13,12 @@ from minisgl.engine.engine import _adjust_config
 from minisgl.layers.marlin import pack_marlin
 from minisgl.models import ModelConfig, create_model
 from minisgl.models.gguf import GGUFWeights
-from minisgl.models.glm4_moe import Glm4MoeMLP, Glm4MoeRouter, Glm4MoeSparseMLP
+from minisgl.models.glm4_moe import (
+    Glm4MoeDecoderLayer,
+    Glm4MoeMLP,
+    Glm4MoeRouter,
+    Glm4MoeSparseMLP,
+)
 from minisgl.moe.ktransformers import load_ktransformers_experts
 from minisgl.utils import torch_dtype
 from transformers import Glm4MoeConfig
@@ -41,6 +48,48 @@ def glm_config(**overrides):
         "max_position_embeddings": 128,
     }
     return Glm4MoeConfig(**(values | overrides))
+
+
+def test_decoder_layer_nvtx_ranges_name_attention_and_moe_by_layer(monkeypatch):
+    ranges = []
+
+    @contextmanager
+    def record_range(name):
+        ranges.append(("enter", name))
+        try:
+            yield
+        finally:
+            ranges.append(("exit", name))
+
+    class Norm:
+        def forward(self, x, residual):
+            return x, residual
+
+    class Op:
+        def forward(self, x):
+            return x
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range", record_range)
+    monkeypatch.setattr(glm4_moe, "submit_dense_layer_kv_shadow", lambda layer_id: None)
+    layer = Glm4MoeDecoderLayer.__new__(Glm4MoeDecoderLayer)
+    layer._layer_id = 4
+    layer._is_dense = True
+    layer.input_layernorm = Norm()
+    layer.self_attn = Op()
+    layer.post_attention_layernorm = Norm()
+    layer.mlp = Op()
+
+    x = torch.zeros(1)
+    output, residual = layer.forward(x, None)
+    assert output is x and residual is None
+    assert ranges == [
+        ("enter", "Layer-4"),
+        ("enter", "Layer-4_attn"),
+        ("exit", "Layer-4_attn"),
+        ("enter", "Layer-4_moe"),
+        ("exit", "Layer-4_moe"),
+        ("exit", "Layer-4"),
+    ]
 
 
 def write_shards(path, config):
