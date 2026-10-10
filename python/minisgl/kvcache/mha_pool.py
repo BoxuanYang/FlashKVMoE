@@ -114,7 +114,7 @@ class MHAKVCache(BaseKVCachePool):
         # allocation on its first layer and releases it when that batch ends.
         self._decode_capacity = max_transfer_tokens
         decode_shape = (
-            2,
+            num_layers,
             max_transfer_tokens,
             2,
             local_kv_heads,
@@ -125,10 +125,10 @@ class MHAKVCache(BaseKVCachePool):
             decode_shape, device="cpu", dtype=dtype, pin_memory=pin_memory
         )
         self._decode_indices_gpu = torch.empty(
-            (2, max_transfer_tokens), device=device, dtype=torch.int32
+            (num_layers, max_transfer_tokens), device=device, dtype=torch.int32
         )
         self._decode_indices_cpu = torch.empty(
-            (2, max_transfer_tokens),
+            (num_layers, max_transfer_tokens),
             device="cpu",
             dtype=torch.int32,
             pin_memory=pin_memory,
@@ -150,6 +150,7 @@ class MHAKVCache(BaseKVCachePool):
         )
         self._last_done_event: torch.cuda.Event | None = None
         self._host_scatter = None
+        self._deferred_decode_scatters: list[tuple[int, tuple[int, ...]]] = []
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]
@@ -173,7 +174,7 @@ class MHAKVCache(BaseKVCachePool):
                 f"KV shadow decode transfer has {count} tokens, exceeding its "
                 f"staging capacity of {self._decode_capacity}"
             )
-        slot = layer_id % 2
+        slot = layer_id
         shape = (count, self._storage_shape[1], self._storage_shape[2])
         self._decode_staging_gpu[slot, :count, 0].copy_(k.view(shape))
         self._decode_staging_gpu[slot, :count, 1].copy_(v.view(shape))
@@ -237,6 +238,7 @@ class MHAKVCache(BaseKVCachePool):
         # They cannot be released until that callback has finished.
         if self._last_done_event is not None:
             self._last_done_event.synchronize()
+        self._last_done_event = None
         self._prefill_staging_gpu = None
         self._prefill_staging_cpu = None
         self._prefill_indices_gpu = None
@@ -277,20 +279,29 @@ class MHAKVCache(BaseKVCachePool):
             v=v,
         )
 
-    def submit_kv_offload(self, layer_id: int) -> None:
-        """Queue the staged layer KV after KT has queued its expert-input D2H copies."""
+    def submit_kv_offload(
+        self, layer_id: int, *, join_producer: bool = True
+    ) -> tuple[int, ...] | None:
+        """Queue D2H and return decode scatter work for the existing KT sync callback.
+
+        Prefill retains its eager per-layer callback because its staging is large and
+        short-lived. Decode adds no host callback: its D2H completion is joined to
+        the producer stream, and KT's already-required sync callback performs the
+        tiny scatter before waiting for CPU MoE completion.
+        """
         count = self._staged_counts[layer_id]
         if count == 0:
-            return
-        slot = layer_id % 2
+            return None
+        is_prefill = self._staged_is_prefill[layer_id]
+        slot = layer_id % 2 if is_prefill else layer_id
         staging_gpu, staging_cpu, indices_gpu, indices_cpu = self.get_buffer(
-            self._staged_is_prefill[layer_id]
+            is_prefill
         )
         if self._device.type != "cuda":
             staging_cpu[slot, :count].copy_(staging_gpu[slot, :count])
             indices_cpu[slot, :count].copy_(indices_gpu[slot, :count])
             self._scatter_staging(layer_id, slot, count, staging_cpu, indices_cpu)
-            return
+            return None
 
         assert self._offload_stream is not None
         producer = torch.cuda.current_stream(self._device)
@@ -299,21 +310,50 @@ class MHAKVCache(BaseKVCachePool):
             self._offload_stream.wait_event(self._ready_events[layer_id])
             staging_cpu[slot, :count].copy_(staging_gpu[slot, :count], non_blocking=True)
             indices_cpu[slot, :count].copy_(indices_gpu[slot, :count], non_blocking=True)
-            if self._host_scatter is None:
-                self._host_scatter = _load_kv_shadow_extension().HostScatterLauncher()
             row_bytes = self._storage_shape[1] * self._storage_shape[2] * self.dtype.itemsize
-            self._host_scatter.launch(
-                self._offload_stream.cuda_stream,
-                self.k_cache_cpu(layer_id).data_ptr(),
-                self.v_cache_cpu(layer_id).data_ptr(),
-                staging_cpu[slot].data_ptr(),
-                indices_cpu[slot].data_ptr(),
-                count,
-                row_bytes,
-                self._cpu_storage_shape[0],
-            )
+            if is_prefill:
+                if self._host_scatter is None:
+                    self._host_scatter = _load_kv_shadow_extension().HostScatterLauncher()
+                self._host_scatter.launch(
+                    self._offload_stream.cuda_stream,
+                    self.k_cache_cpu(layer_id).data_ptr(),
+                    self.v_cache_cpu(layer_id).data_ptr(),
+                    staging_cpu[slot].data_ptr(),
+                    indices_cpu[slot].data_ptr(),
+                    count,
+                    row_bytes,
+                    self._cpu_storage_shape[0],
+                )
             self._done_events[layer_id].record(self._offload_stream)
-        self._last_done_event = self._done_events[layer_id]
+        if is_prefill:
+            self._last_done_event = self._done_events[layer_id]
+            return None
+
+        # The following KT sync callback cannot run until both pinned copies are
+        # ready. This event wait is a device dependency, not a new host callback.
+        if join_producer:
+            producer.wait_event(self._done_events[layer_id])
+        return (
+            self.k_cache_cpu(layer_id).data_ptr(),
+            self.v_cache_cpu(layer_id).data_ptr(),
+            staging_cpu[slot].data_ptr(),
+            indices_cpu[slot].data_ptr(),
+            count,
+            row_bytes,
+            self._cpu_storage_shape[0],
+        )
+
+    def defer_kv_scatter(self, layer_id: int, plan: tuple[int, ...]) -> None:
+        self._deferred_decode_scatters.append((layer_id, plan))
+
+    def take_deferred_kv_scatters(self) -> list[tuple[int, ...]]:
+        pending = self._deferred_decode_scatters
+        self._deferred_decode_scatters = []
+        if self._device.type == "cuda":
+            producer = torch.cuda.current_stream(self._device)
+            for layer_id, _ in pending:
+                producer.wait_event(self._done_events[layer_id])
+        return [plan for _, plan in pending]
 
     def _scatter_staging(
         self,

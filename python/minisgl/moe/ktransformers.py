@@ -83,9 +83,10 @@ def forward_with_kv_shadow(
     """Run KT while shadowing this layer's newly generated KV in CPU DRAM.
 
     KT already exposes the exact split needed here: ``submit_forward`` queues
-    expert_ids/hidden_states/weights D2H and the CPU task, while ``sync_forward``
-    waits for CPU completion and copies its output H2D. The KV D2H is inserted
-    between them, so it overlaps CPU MoE without contending with KT input D2H.
+    expert_ids/hidden_states/weights D2H and starts the CPU task, while
+    ``sync_forward`` waits for CPU completion and copies its output H2D. KV D2H
+    is inserted between them, then its scatter is fused into KT's existing sync
+    callback. Decode therefore adds no CUDA host callback of its own.
     """
     stream = torch.cuda.current_stream(hidden_states.device)
     try:
@@ -97,10 +98,19 @@ def forward_with_kv_shadow(
             hidden_states, expert_ids, expert_weights, stream.cuda_stream
         )
 
+    # Prefill still uses its eager per-layer scatter callback and two staging
+    # slots. Decode never sets _last_done_event, so this is a no-op there.
     kv_cache.sync_kv_offload()
     wrapper.submit_forward(hidden_states, expert_ids, expert_weights, stream.cuda_stream)
-    kv_cache.submit_kv_offload(wrapper.layer_idx)
-    return wrapper.sync_forward(hidden_states, stream.cuda_stream)
+    scatter_plan = kv_cache.submit_kv_offload(wrapper.layer_idx)
+    scatter_plans = kv_cache.take_deferred_kv_scatters()
+    if scatter_plan is not None:
+        scatter_plans.append(scatter_plan)
+    return wrapper.sync_forward(
+        hidden_states,
+        stream.cuda_stream,
+        kv_scatter_plans=[list(plan) for plan in scatter_plans],
+    )
 
 
 def submit_dense_layer_kv_shadow(layer_id: int) -> None:
@@ -111,7 +121,11 @@ def submit_dense_layer_kv_shadow(layer_id: int) -> None:
         return
     if kv_cache.shadow_enabled:
         kv_cache.sync_kv_offload()
-        kv_cache.submit_kv_offload(layer_id)
+        scatter_plan = kv_cache.submit_kv_offload(layer_id, join_producer=False)
+        if scatter_plan is not None:
+            # GLM/DeepSeek dense layers precede routed layers. Fuse their decode
+            # scatters into the first subsequent KT sync callback as well.
+            kv_cache.defer_kv_scatter(layer_id, scatter_plan)
 
 
 class KTransformersMoE(BaseOP):

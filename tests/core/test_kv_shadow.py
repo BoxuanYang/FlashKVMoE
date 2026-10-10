@@ -41,6 +41,32 @@ def test_gather_then_store_builds_host_shadow(monkeypatch):
     assert pool.num_cpu_pages == 6
 
 
+def test_decode_uses_layer_private_staging_and_builds_host_shadow(monkeypatch):
+    monkeypatch.setattr(dist_info, "_TP_INFO", DistributedInfo(0, 1))
+    pool = MHAKVCache(
+        num_kv_heads=1,
+        num_layers=3,
+        head_dim=4,
+        num_pages=4,
+        page_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_cpu_pages=4,
+        max_transfer_tokens=2,
+    )
+    locations = torch.tensor([2, 0], dtype=torch.int32)
+    k = torch.arange(8, dtype=torch.float32).view(2, 1, 4)
+    v = k + 100
+
+    pool.gather_decode_kv(k, v, locations, layer_id=2)
+    plan = pool.submit_kv_offload(layer_id=2)
+
+    assert plan is None  # CPU execution scatters immediately.
+    assert pool._decode_staging_gpu.shape[0] == 3
+    torch.testing.assert_close(pool.k_cache_cpu(2).view(4, 1, 4)[locations.long()], k)
+    torch.testing.assert_close(pool.v_cache_cpu(2).view(4, 1, 4)[locations.long()], v)
+
+
 def test_prefill_staging_is_exact_size_and_released_per_batch(monkeypatch):
     monkeypatch.setattr(dist_info, "_TP_INFO", DistributedInfo(0, 1))
     pool = MHAKVCache(
@@ -181,15 +207,22 @@ def test_flashinfer_selects_phase_gather_before_paged_store(monkeypatch):
 
 def test_kt_submission_wraps_kv_d2h_around_cpu_moe(monkeypatch):
     calls = []
+    plan = (1, 2, 3, 4, 5, 6, 7)
+    deferred_plan = (8, 9, 10, 11, 12, 13, 14)
 
     class Cache:
         shadow_enabled = True
 
         def sync_kv_offload(self):
-            calls.append("kv-sync")
+            calls.append("kv-prefill-sync")
 
         def submit_kv_offload(self, layer_id):
             calls.append(("kv-submit", layer_id))
+            return plan
+
+        def take_deferred_kv_scatters(self):
+            calls.append("kv-take-deferred")
+            return [deferred_plan]
 
     class Wrapper:
         layer_idx = 7
@@ -197,8 +230,8 @@ def test_kt_submission_wraps_kv_d2h_around_cpu_moe(monkeypatch):
         def submit_forward(self, hidden, ids, weights, stream):
             calls.append("moe-submit")
 
-        def sync_forward(self, hidden, stream):
-            calls.append("moe-sync")
+        def sync_forward(self, hidden, stream, kv_scatter_plans=None):
+            calls.append(("moe-sync", kv_scatter_plans))
             return hidden
 
     monkeypatch.setattr(ktransformers, "get_global_ctx", lambda: SimpleNamespace(kv_cache=Cache()))
@@ -211,4 +244,38 @@ def test_kt_submission_wraps_kv_d2h_around_cpu_moe(monkeypatch):
     )
 
     assert result is hidden
-    assert calls == ["kv-sync", "moe-submit", ("kv-submit", 7), "moe-sync"]
+    assert calls == [
+        "kv-prefill-sync",
+        "moe-submit",
+        ("kv-submit", 7),
+        "kv-take-deferred",
+        ("moe-sync", [list(deferred_plan), list(plan)]),
+    ]
+
+
+def test_dense_decode_scatter_is_deferred_to_next_moe_sync(monkeypatch):
+    calls = []
+    plan = (1, 2, 3, 4, 5, 6, 7)
+
+    class Cache:
+        shadow_enabled = True
+
+        def sync_kv_offload(self):
+            calls.append("kv-prefill-sync")
+
+        def submit_kv_offload(self, layer_id, *, join_producer=True):
+            calls.append(("kv-submit", layer_id, join_producer))
+            return plan
+
+        def defer_kv_scatter(self, layer_id, value):
+            calls.append(("kv-defer", layer_id, value))
+
+    monkeypatch.setattr(ktransformers, "get_global_ctx", lambda: SimpleNamespace(kv_cache=Cache()))
+
+    ktransformers.submit_dense_layer_kv_shadow(0)
+
+    assert calls == [
+        "kv-prefill-sync",
+        ("kv-submit", 0, False),
+        ("kv-defer", 0, plan),
+    ]

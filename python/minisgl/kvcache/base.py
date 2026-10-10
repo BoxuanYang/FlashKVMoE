@@ -37,8 +37,17 @@ class BaseKVCachePool(ABC):
     def release_prefill_kv_offload(self) -> None:
         """Release per-batch eager prefill staging, if supported."""
 
-    def submit_kv_offload(self, layer_id: int) -> None:
-        """Submit a generated layer to the host shadow, if supported."""
+    def submit_kv_offload(
+        self, layer_id: int, *, join_producer: bool = True
+    ) -> tuple[int, ...] | None:
+        """Submit a generated layer and optionally return a fused scatter plan."""
+
+    def defer_kv_scatter(self, layer_id: int, plan: tuple[int, ...]) -> None:
+        """Hold a decode scatter plan until the next KT sync callback."""
+
+    def take_deferred_kv_scatters(self) -> list[tuple[int, ...]]:
+        """Return and clear decode scatter plans waiting for a KT sync callback."""
+        return []
 
     def sync_kv_offload(self) -> None:
         """Order subsequent device work after the latest host-shadow update."""
