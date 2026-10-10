@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -10,16 +11,38 @@ from minisgl.utils import div_even
 from .base import BaseKVCachePool
 
 
+def _kv_shadow_extension_paths(*roots: str | None) -> tuple[list[str], list[str]]:
+    include_paths: list[str] = []
+    linker_flags: list[str] = []
+    for root in dict.fromkeys(root for root in roots if root):
+        # NVIDIA's conda CUDA packages use a target sysroot instead of the
+        # traditional $CUDA_HOME/{include,lib64} layout.  cpp_extension does
+        # not add these paths when a .cpp source includes cuda_runtime.h.
+        target = Path(root) / "targets" / "x86_64-linux"
+        include_dir = target / "include"
+        library_dir = target / "lib"
+        if (include_dir / "cuda_runtime.h").is_file():
+            include_paths.append(str(include_dir))
+        if library_dir.is_dir():
+            linker_flags.extend((f"-L{library_dir}", f"-Wl,-rpath,{library_dir}"))
+    return include_paths, linker_flags
+
+
 @lru_cache(maxsize=1)
 def _load_kv_shadow_extension():
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import CUDA_HOME, load
 
     source = Path(__file__).parents[1] / "kernel/csrc/src/kv_shadow.cpp"
+    include_paths, linker_flags = _kv_shadow_extension_paths(
+        CUDA_HOME, os.environ.get("CONDA_PREFIX")
+    )
     return load(
         name="minisgl_kv_shadow",
         sources=[str(source)],
         with_cuda=True,
         extra_cflags=["-O3", "-std=c++17"],
+        extra_include_paths=include_paths,
+        extra_ldflags=linker_flags,
     )
 
 
@@ -313,6 +336,16 @@ class MHAKVCache(BaseKVCachePool):
         """
         if self._device.type == "cuda" and self._last_done_event is not None:
             torch.cuda.current_stream(self._device).wait_event(self._last_done_event)
+
+    def reset_kv_offload_sync(self) -> None:
+        """Drop event provenance after all eager work has completed or a graph was captured.
+
+        CUDA stream capture may only wait on work that belongs to the same
+        capture.  The event objects themselves remain alive in ``_done_events``
+        for captured graph nodes; only the Python-side "latest event" marker is
+        cleared so the next eager/capture generation starts independently.
+        """
+        self._last_done_event = None
 
     @property
     def shadow_enabled(self) -> bool:

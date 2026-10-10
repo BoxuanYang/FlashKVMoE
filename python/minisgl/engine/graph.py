@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -15,6 +16,16 @@ if TYPE_CHECKING:
     from minisgl.models import BaseLLMModel
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _isolated_kv_offload_capture(kv_cache):
+    """Keep eager and captured side-stream event generations disjoint."""
+    kv_cache.reset_kv_offload_sync()
+    try:
+        yield
+    finally:
+        kv_cache.reset_kv_offload_sync()
 
 
 @dataclass
@@ -129,6 +140,7 @@ class GraphRunner:
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
         pool = None
+        kv_cache = get_global_ctx().kv_cache
         for bs in pbar:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
@@ -140,14 +152,17 @@ class GraphRunner:
             self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
-                get_global_ctx().kv_cache.sync_kv_offload()
+                kv_cache.sync_kv_offload()
                 # Finish warmup (including CPU expert callbacks) before capture.
                 self.stream.synchronize()
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
-                    # Join the side D2H stream so every captured graph is a
-                    # self-contained fork/join graph and staging is reusable.
-                    get_global_ctx().kv_cache.sync_kv_offload()
+                # The last warmup event was recorded outside the graph.  Waiting
+                # on it while capturing would violate CUDA capture isolation.
+                with _isolated_kv_offload_capture(kv_cache):
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        self.buffer.logits[:bs] = model.forward()
+                        # Join the side D2H stream so every captured graph is a
+                        # self-contained fork/join graph and staging is reusable.
+                        kv_cache.sync_kv_offload()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph

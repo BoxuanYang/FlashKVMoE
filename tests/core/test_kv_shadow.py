@@ -4,7 +4,8 @@ import minisgl.distributed.info as dist_info
 import torch
 from minisgl.attention import fi
 from minisgl.distributed import DistributedInfo
-from minisgl.kvcache.mha_pool import MHAKVCache
+from minisgl.engine.graph import _isolated_kv_offload_capture
+from minisgl.kvcache.mha_pool import MHAKVCache, _kv_shadow_extension_paths
 from minisgl.moe import ktransformers
 
 
@@ -72,6 +73,58 @@ def test_prefill_staging_is_exact_size_and_released_per_batch(monkeypatch):
     assert pool._prefill_staging_cpu is None
     assert pool._prefill_indices_gpu is None
     assert pool._prefill_indices_cpu is None
+
+
+def test_reset_kv_offload_sync_forgets_only_latest_event(monkeypatch):
+    monkeypatch.setattr(dist_info, "_TP_INFO", DistributedInfo(0, 1))
+    pool = MHAKVCache(
+        num_kv_heads=1,
+        num_layers=2,
+        head_dim=4,
+        num_pages=4,
+        page_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    done_events = pool._done_events
+    pool._last_done_event = object()
+
+    pool.reset_kv_offload_sync()
+
+    assert pool._last_done_event is None
+    assert pool._done_events is done_events
+
+
+def test_capture_boundary_resets_eager_and_captured_event_generations():
+    class Cache:
+        def __init__(self):
+            self.latest = "eager"
+            self.resets = 0
+
+        def reset_kv_offload_sync(self):
+            self.latest = None
+            self.resets += 1
+
+    cache = Cache()
+    with _isolated_kv_offload_capture(cache):
+        assert cache.latest is None
+        cache.latest = "captured"
+
+    assert cache.latest is None
+    assert cache.resets == 2
+
+
+def test_conda_cuda_target_sysroot_is_added_to_extension_build(tmp_path):
+    include_dir = tmp_path / "targets" / "x86_64-linux" / "include"
+    library_dir = tmp_path / "targets" / "x86_64-linux" / "lib"
+    include_dir.mkdir(parents=True)
+    library_dir.mkdir(parents=True)
+    (include_dir / "cuda_runtime.h").touch()
+
+    includes, flags = _kv_shadow_extension_paths(str(tmp_path), str(tmp_path))
+
+    assert includes == [str(include_dir)]
+    assert flags == [f"-L{library_dir}", f"-Wl,-rpath,{library_dir}"]
 
 
 def test_flashinfer_selects_phase_gather_before_paged_store(monkeypatch):

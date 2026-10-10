@@ -43,6 +43,9 @@ class BaseKVCachePool(ABC):
     def sync_kv_offload(self) -> None:
         """Order subsequent device work after the latest host-shadow update."""
 
+    def reset_kv_offload_sync(self) -> None:
+        """Forget completed/captured offload dependencies at a graph boundary."""
+
     @property
     def shadow_enabled(self) -> bool:
         return False
